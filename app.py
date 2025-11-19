@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram Word-Splitter Bot (Webhook-ready) using PostgreSQL (V5).
+Telegram Word-Splitter Bot (Webhook-ready) using PostgreSQL (V5.2).
 
-This version is the complete, working script:
-1. Replaced all SQLite logic with PostgreSQL (psycopg2) and uses %s placeholders.
-2. Uses DATABASE_URL environment variable.
-3. Implements non-blocking scheduler and thread-safe user locks.
-4. Includes all necessary utility, task, and command handling functions.
+Features:
+1. Full PostgreSQL implementation (psycopg2) for high concurrency.
+2. Fixes the /example command.
+3. Ensures immediate and reliable split execution via improved lock handling.
+4. Uses %s placeholders for PostgreSQL queries.
 """
 import os
 import time
@@ -49,18 +49,16 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 # --- DB helper for PostgreSQL ---
 
 _db_lock = threading.Lock()
-# Global connection object (used cautiously with the lock)
 _conn = None
 
 def get_db_connection() -> psycopg2.extensions.connection:
     """Connects to the database and returns the connection."""
     global _conn
     if _conn is None or _conn.closed != 0:
-        logger.info("Connecting to PostgreSQL...")
+        logger.info("Reconnecting to PostgreSQL...")
         try:
-            # Use sslmode for cloud hosting, parse.urlparse for connection details
             _conn = psycopg2.connect(DATABASE_URL, sslmode='require') 
-            _conn.autocommit = True  # Ensure immediate writes/commits
+            _conn.autocommit = True  
         except Exception:
             logger.exception("Failed to connect to PostgreSQL")
             raise
@@ -138,26 +136,32 @@ def init_db():
 
 def db_execute(query: str, params: tuple = (), fetch: bool = False) -> Any:
     """
-    Executes a database query using the global connection, protected by a lock.
-    Uses %s placeholders for PostgreSQL.
+    Executes a database query with connection resilience (retry on Interface/Operational Errors).
     """
-    with _db_lock:
-        try:
-            conn = get_db_connection()
-            with conn.cursor() as c:
-                c.execute(query, params)
-                if fetch:
-                    return c.fetchall()
-                # autocommit is True, so changes are committed immediately
-        except Exception:
-            logger.exception(f"DB Execution Failed: {query}")
-            # Attempt to close/re-open the connection on error to clear bad state
-            global _conn
-            if _conn and _conn.closed == 0:
-                try: _conn.close() 
-                except: pass
-            _conn = None 
-            raise
+    global _conn
+    
+    for attempt in range(2):
+        with _db_lock:
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as c:
+                    c.execute(query, params)
+                    if fetch:
+                        return c.fetchall()
+                    return None
+            except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
+                logger.warning(f"DB Interface Error (Attempt {attempt+1}): {e}. Resetting connection.")
+                if _conn and _conn.closed == 0:
+                    try: _conn.close() 
+                    except: pass
+                _conn = None 
+                
+                if attempt == 1:
+                    logger.error(f"Failed to execute query after retry: {query}")
+                    raise 
+            except Exception:
+                logger.error(f"DB Execution Failed: {query}")
+                raise
 
 # Initialize DB
 init_db()
@@ -366,7 +370,7 @@ def send_word_and_schedule_next(task_id: int, user_id: int, chat_id: int, words:
     lock = get_user_lock(user_id)
     
     if not lock.acquire(blocking=False):
-        logger.warning(f"Scheduler failed to acquire lock for task {task_id}. Skipping cycle.")
+        logger.warning(f"Scheduler failed to acquire lock for task {task_id}. Aborting scheduler job.")
         return
     
     try:
@@ -436,20 +440,14 @@ def send_word_and_schedule_next(task_id: int, user_id: int, chat_id: int, words:
         set_task_status(task_id, "cancelled")
         send_message(chat_id, "❌ Critical Error: Word transmission failed unexpectedly and has been stopped.")
     finally:
-        # Check status again to determine if the lock should be released or passed to the next cycle
-        final_status_row = db_execute("SELECT status FROM tasks WHERE id = %s", (task_id,), fetch=True)
-        final_status = final_status_row[0][0] if final_status_row else "error"
-        
-        if final_status in ('done', 'cancelled', 'paused'):
-            if lock.locked():
-                 lock.release()
-                 if final_status != 'paused':
-                    # Immediately start the next task
-                    threading.Thread(target=_start_next_queued_task_if_exists, args=(user_id, user_id, username), daemon=True).start()
-        elif final_status == 'running':
-            # Release lock so other threads (like webhook commands) can acquire it
-            if lock.locked():
-                lock.release()
+        # Crucial: Release the lock immediately after *this* scheduled job finishes its work
+        if lock.locked():
+             lock.release()
+             # If released due to completion/cancellation/pause, try starting the next task.
+             final_status_row = db_execute("SELECT status FROM tasks WHERE id = %s", (task_id,), fetch=True)
+             final_status = final_status_row[0][0] if final_status_row else "error"
+             if final_status in ('done', 'cancelled'):
+                 threading.Thread(target=_start_next_queued_task_if_exists, args=(user_id, user_id, username), daemon=True).start()
 
 # --- Background worker to process tasks for users ---
 
@@ -482,6 +480,7 @@ def _start_next_queued_task_if_exists(user_id: int, chat_id: int, username: str)
         )
         send_message(chat_id, start_msg)
         
+        # Schedule the very first word immediately (0.1s delay for stability)
         scheduler.add_job(
             send_word_and_schedule_next, 
             "date", 
@@ -513,12 +512,10 @@ def global_worker_loop():
     """Runs less often and only checks for queued users not currently locked."""
     while not _worker_stop.is_set():
         try:
-            # Check for users with queued tasks
             rows = db_execute("SELECT DISTINCT user_id, username FROM tasks WHERE status = 'queued' ORDER BY created_at ASC", fetch=True)
             for r in rows:
                 user_id = r[0]
                 username = r[1] or ""
-                # Attempt to start the task only if the lock is not currently held
                 if not get_user_lock(user_id).locked():
                      t = threading.Thread(target=_start_next_queued_task_if_exists, args=(user_id, user_id, username), daemon=True)
                      t.start()
@@ -536,7 +533,6 @@ def delete_old_bot_messages():
         try:
             delete_message(m["chat_id"], m["message_id"])
         except Exception:
-            # If deletion fails, mark as deleted anyway to prevent repeated attempts
             db_execute("UPDATE sent_messages SET deleted = TRUE WHERE chat_id = %s AND message_id = %s", (m["chat_id"], m["message_id"]))
 
 scheduler.add_job(lambda: send_message(OWNER_ID, "Health Check"), "interval", hours=1) 
@@ -576,7 +572,7 @@ def webhook():
 
 def handle_command(user_id: int, username: str, command: str, args: str):
     
-    if not is_allowed(user_id) and command not in ("/start", "/help"):
+    if not is_allowed(user_id) and command not in ("/start", "/help", "/example"):
         send_message(user_id, f"❌ Sorry! You are not allowed to use this bot.")
         return jsonify({"ok": True})
         
@@ -591,6 +587,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, body)
         return jsonify({"ok": True})
         
+    if command == "/example": 
+        example_text = "This is an example text to demonstrate the word splitting feature of the bot. It should start immediately."
+        return handle_new_text(user_id, username, example_text)
+
     if command == "/pause": 
         active_task = get_running_task_for_user(user_id)
         if not active_task or active_task["status"] != "running": 
@@ -644,7 +644,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             logger.exception("Error resuming task")
             send_message(user_id, "❌ Failed to resume due to an internal error.")
         finally:
-            pass # Lock is passed to the scheduler chain
+            pass 
 
         return jsonify({"ok": True}) 
         
@@ -707,7 +707,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if not is_admin(user_id): send_message(user_id, "❌ You are not allowed to use this command.") ; return jsonify({"ok": True}) 
         rows = db_execute("SELECT user_id, username, is_admin, added_at FROM allowed_users", fetch=True) 
         lines = [] 
-        for r in rows: lines.append(f"{r[0]} @{r[1] or ''} admin={r[2]} added={r[3].isoformat()}") 
+        for r in rows: 
+             # Check if r[3] is a datetime object, convert it to isoformat if it is
+            date_str = r[3].isoformat() if isinstance(r[3], datetime) else str(r[3])
+            lines.append(f"{r[0]} @{r[1] or ''} admin={r[2]} added={date_str}") 
         body = "Allowed users:\n" + ("\n".join(lines) if lines else "(none)") 
         send_message(user_id, body) 
         return jsonify({"ok": True}) 
@@ -765,7 +768,7 @@ def handle_new_text(user_id: int, username: str, text: str):
     qsize = get_queue_size(user_id)
     
     if qsize == 1:
-        # Task is next in line: start it immediately
+        # CRITICAL START: Start the first task immediately
         threading.Thread(target=_start_next_queued_task_if_exists, args=(user_id, user_id, username), daemon=True).start()
         send_message(user_id, f"🚀 Task queued and **starting now**. Words: {res['total_words']}. Time per word: {compute_interval(res['total_words'])}s")
     else:
@@ -791,7 +794,6 @@ def root_forward():
 def health():
     logger.info("Health check from %s method=%s", request.remote_addr, request.method)
     try:
-        # A simple, fast query to test DB connectivity
         db_execute("SELECT 1", fetch=True)
         return jsonify({"ok": True, "time": datetime.utcnow().isoformat()}), 200
     except Exception:
