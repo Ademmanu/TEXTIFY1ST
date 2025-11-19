@@ -1,124 +1,93 @@
-#!/usr/bin/env python3
-"""
-Optimized Telegram Word-Splitter Bot (precise dynamic splitting, fast responses, thread-safe, minimal drift).
-
-Summary of key optimizations:
-- Word splitting loop now uses precise interval scheduling (not "sleep after send"), so dynamic delay is always honored regardless of network or Telegram API latency.
-- Uses time.monotonic() for accurate time measurement and minimal drift.
-- Batch fetch per-user pending queue only once before entering split, to reduce DB round-trips.
-- Telegram API errors are more robustly logged, but won't block the schedule.
-- All threaded user workers are daemons for easy cleanup—no leaks.
-- Slightly batched DB locking.
-- General redundant DB queries reduced (e.g., only check status when really needed).
-- Maintains all original bot features, but does NOT require python-telegram-bot.
-"""
-
 import os
 import time
 import json
-import sqlite3
 import threading
 import traceback
 import logging
 from datetime import datetime, timedelta
 from typing import List
+
+import psycopg2
+import psycopg2.extras
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, jsonify
 import requests
 
-# Init logging
+# ========== CONFIG ==========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Environment configs
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "justmemmy")
 MAX_ALLOWED_USERS = int(os.environ.get("MAX_ALLOWED_USERS", "50"))
 MAX_QUEUE_PER_USER = int(os.environ.get("MAX_QUEUE_PER_USER", "50"))
 MAINTENANCE_START_HOUR_WAT = 3
 MAINTENANCE_END_HOUR_WAT = 4
-DB_PATH = os.environ.get("DB_PATH", "botdata.sqlite3")
 REQUESTS_TIMEOUT = float(os.environ.get("REQUESTS_TIMEOUT", "10"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else None
 
+# ========== POSTGRES DB HELPERS ==========
 _db_lock = threading.Lock()
-
-def init_db():
-    with _db_lock, sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS allowed_users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                added_at TEXT,
-                is_admin INTEGER DEFAULT 0
-            )""")
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                text TEXT,
-                words_json TEXT,
-                total_words INTEGER,
-                status TEXT,
-                created_at TEXT,
-                started_at TEXT,
-                finished_at TEXT
-            )""")
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS split_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                words INTEGER,
-                created_at TEXT
-            )""")
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS sent_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                message_id INTEGER,
-                sent_at TEXT,
-                deleted INTEGER DEFAULT 0
-            )""")
-        conn.commit()
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
 
 def db_execute(query, params=(), fetch=False):
-    with _db_lock, sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute(query, params)
-        if fetch:
-            return c.fetchall()
+    with _db_lock, get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            if fetch:
+                return cur.fetchall()
+            conn.commit()
+
+def init_db():
+    queries = [
+        """CREATE TABLE IF NOT EXISTS allowed_users (
+               user_id BIGINT PRIMARY KEY,
+               username TEXT,
+               added_at TIMESTAMPTZ,
+               is_admin INTEGER DEFAULT 0
+           )""",
+        """CREATE TABLE IF NOT EXISTS tasks (
+               id SERIAL PRIMARY KEY,
+               user_id BIGINT,
+               username TEXT,
+               text TEXT,
+               words_json TEXT,
+               total_words INTEGER,
+               status TEXT,
+               created_at TIMESTAMPTZ,
+               started_at TIMESTAMPTZ,
+               finished_at TIMESTAMPTZ
+           )""",
+        """CREATE TABLE IF NOT EXISTS split_logs (
+               id SERIAL PRIMARY KEY,
+               user_id BIGINT,
+               username TEXT,
+               words INTEGER,
+               created_at TIMESTAMPTZ
+           )""",
+        """CREATE TABLE IF NOT EXISTS sent_messages (
+               id SERIAL PRIMARY KEY,
+               chat_id BIGINT,
+               message_id INTEGER,
+               sent_at TIMESTAMPTZ,
+               deleted INTEGER DEFAULT 0
+           )""",
+    ]
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for q in queries:
+                cur.execute(q)
         conn.commit()
 
-# Ensure DB and admin row
-init_db()
-try:
-    res = db_execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (OWNER_ID,), fetch=True)
-    if not res:
-        db_execute(
-            "INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
-            (OWNER_ID, OWNER_USERNAME, datetime.utcnow().isoformat(), 1)
-        )
-except Exception as e:
-    logger.exception("Error ensuring owner in allowed_users")
+# ========== UTILITY & INITIALIZE ==========
 
-# Per-user threading lock
-user_locks = {}
-user_locks_lock = threading.Lock()
-def get_user_lock(user_id):
-    with user_locks_lock:
-        if user_id not in user_locks:
-            user_locks[user_id] = threading.Lock()
-        return user_locks[user_id]
-
-# Helpers
 def get_now_iso():
     return datetime.utcnow().isoformat()
 
@@ -126,16 +95,15 @@ def split_text_into_words(text: str) -> List[str]:
     return [w for w in text.strip().split() if w]
 
 def compute_interval(total_words: int) -> float:
-    # Shorter words = quicker pace, but still >=0.2s for safety.
-    # Tweak these thresholds lower if Telegram proves reliable & you want even faster.
+    # Dynamic delay, slightly more aggressive for PostgreSQL (less lock).
     if total_words <= 150:
-        return 0.3
+        return 0.25
     elif total_words <= 300:
-        return 0.4
+        return 0.35
     elif total_words <= 1000:
-        return 0.5
+        return 0.45
     else:
-        return 0.6
+        return 0.55
 
 def is_maintenance_now() -> bool:
     utc_now = datetime.utcnow()
@@ -145,7 +113,8 @@ def is_maintenance_now() -> bool:
         return MAINTENANCE_START_HOUR_WAT <= h < MAINTENANCE_END_HOUR_WAT
     return h >= MAINTENANCE_START_HOUR_WAT or h < MAINTENANCE_END_HOUR_WAT
 
-# Telegram API
+# ========== TELEGRAM HELPERS ==========
+
 def tg_call(method: str, payload: dict):
     if not TELEGRAM_API:
         logger.error("tg_call attempted but TELEGRAM_API not configured")
@@ -197,65 +166,90 @@ def set_webhook():
         logger.exception("Failed to set webhook")
         return None
 
-# Task + stats
+# ========== INITIALIZE DB & ALLOWED USERS ==========
+
+init_db()
+try:
+    res = db_execute("SELECT user_id FROM allowed_users WHERE user_id = %s", (OWNER_ID,), fetch=True)
+    if not res:
+        db_execute(
+            "INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (%s, %s, %s, %s)",
+            (OWNER_ID, OWNER_USERNAME, get_now_iso(), 1)
+        )
+except Exception:
+    logger.exception("Error ensuring owner in allowed_users")
+
+# ========== PER-USER LOCKS ==========
+
+user_locks = {}
+user_locks_lock = threading.Lock()
+def get_user_lock(user_id):
+    with user_locks_lock:
+        if user_id not in user_locks:
+            user_locks[user_id] = threading.Lock()
+        return user_locks[user_id]
+
+# ========== TASK/STATS QUERIES ==========
+
 def enqueue_task(user_id: int, username: str, text: str) -> dict:
     words = split_text_into_words(text)
     total = len(words)
     if total == 0:
         return {"ok": False, "reason": "empty"}
     q = db_execute(
-        "SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status IN ('queued','running','paused')",
+        "SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status IN ('queued','running','paused')",
         (user_id,), fetch=True
     )
     pending = q[0][0] if q else 0
     if pending >= MAX_QUEUE_PER_USER:
         return {"ok": False, "reason": "queue_full", "queue_size": pending}
     db_execute(
-        "INSERT INTO tasks (user_id, username, text, words_json, total_words, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO tasks (user_id, username, text, words_json, total_words, status, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
         (user_id, username, text, json.dumps(words), total, "queued", get_now_iso()),
     )
     return {"ok": True, "total_words": total, "queue_size": pending + 1}
 
 def get_next_task_for_user(user_id: int):
     rows = db_execute(
-        "SELECT id, words_json, total_words, text FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1",
+        "SELECT id, words_json, total_words, text FROM tasks WHERE user_id = %s AND status = 'queued' ORDER BY id ASC LIMIT 1",
         (user_id,), fetch=True
     )
     if not rows:
         return None
     r = rows[0]
-    return {"id": r[0], "words": json.loads(r[1]), "total_words": r[2], "text": r[3]}
+    return {"id": r['id'], "words": json.loads(r['words_json']), "total_words": r['total_words'], "text": r['text']}
 
 def set_task_status(task_id: int, status: str):
+    now = get_now_iso()
     if status == "running":
-        db_execute("UPDATE tasks SET status = ?, started_at = ? WHERE id = ?", (status, get_now_iso(), task_id))
+        db_execute("UPDATE tasks SET status = %s, started_at = %s WHERE id = %s", (status, now, task_id))
     elif status in ("done", "cancelled"):
-        db_execute("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", (status, get_now_iso(), task_id))
+        db_execute("UPDATE tasks SET status = %s, finished_at = %s WHERE id = %s", (status, now, task_id))
     else:
-        db_execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        db_execute("UPDATE tasks SET status = %s WHERE id = %s", (status, task_id))
 
 def mark_task_paused(task_id: int): set_task_status(task_id, "paused")
 def mark_task_resumed(task_id: int): set_task_status(task_id, "running")
 def mark_task_done(task_id: int): set_task_status(task_id, "done")
 
 def cancel_active_task_for_user(user_id: int):
-    rows = db_execute("SELECT id FROM tasks WHERE user_id = ? AND status IN ('queued','running','paused')", (user_id,), fetch=True)
+    rows = db_execute("SELECT id FROM tasks WHERE user_id = %s AND status IN ('queued','running','paused')", (user_id,), fetch=True)
     count = 0
     for r in rows:
-        db_execute("UPDATE tasks SET status = ? WHERE id = ?", ("cancelled", r[0]))
+        db_execute("UPDATE tasks SET status = %s WHERE id = %s", ("cancelled", r["id"]))
         count += 1
     return count
 
 def record_split_log(user_id: int, username: str, words: int):
-    db_execute("INSERT INTO split_logs (user_id, username, words, created_at) VALUES (?, ?, ?, ?)",
+    db_execute("INSERT INTO split_logs (user_id, username, words, created_at) VALUES (%s, %s, %s, %s)",
                (user_id, username, words, get_now_iso()))
 
 def record_sent_message(chat_id: int, message_id: int):
-    db_execute("INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (?, ?, ?, 0)",
+    db_execute("INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (%s, %s, %s, 0)",
                (chat_id, message_id, get_now_iso()))
 
 def mark_message_deleted(chat_id: int, message_id: int):
-    db_execute("UPDATE sent_messages SET deleted = 1 WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
+    db_execute("UPDATE sent_messages SET deleted = 1 WHERE chat_id = %s AND message_id = %s", (chat_id, message_id))
 
 def get_messages_older_than(days=1):
     cutoff = datetime.utcnow() - timedelta(days=days)
@@ -263,23 +257,26 @@ def get_messages_older_than(days=1):
     res = []
     for r in rows:
         try:
-            sent_at = datetime.fromisoformat(r[2])
+            sent_at = r["sent_at"]
+            if isinstance(sent_at, str):
+                sent_at = datetime.fromisoformat(sent_at)
         except Exception:
             continue
         if sent_at < cutoff:
-            res.append({"chat_id": r[0], "message_id": r[1]})
+            res.append({"chat_id": r["chat_id"], "message_id": r["message_id"]})
     return res
 
 def is_allowed(user_id: int) -> bool:
-    return bool(db_execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,), fetch=True))
+    user = db_execute("SELECT 1 FROM allowed_users WHERE user_id = %s", (user_id,), fetch=True)
+    return bool(user)
 
 def is_admin(user_id: int) -> bool:
-    rows = db_execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,), fetch=True)
-    return bool(rows and rows[0][0])
+    rows = db_execute("SELECT is_admin FROM allowed_users WHERE user_id = %s", (user_id,), fetch=True)
+    return bool(rows and rows[0]['is_admin'])
 
-# -- OPTIMIZED WORKER LOOP WITH PRECISE DYNAMIC DELAY --------
+# ========== CORE PRECISION SPLITTER ==========
+
 _worker_stop = threading.Event()
-
 def process_user_queue(user_id: int, chat_id: int, username: str):
     lock = get_user_lock(user_id)
     if not lock.acquire(blocking=False):
@@ -289,33 +286,29 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             task = get_next_task_for_user(user_id)
             if not task:
                 break
-            task_id = task["id"]
-            words = task["words"]
-            total = task["total_words"]
+            task_id, words, total = task["id"], task["words"], task["total_words"]
             set_task_status(task_id, "running")
-            qcount = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
+            qcount = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status = 'queued'", (user_id,), fetch=True)[0][0]
             interval = compute_interval(total)
             est_seconds = interval * total
             est_str = str(timedelta(seconds=int(est_seconds)))
             send_message(chat_id, f"🚀 Task Starting! (Waiting: {qcount})\nWords: {total}. Time per word: **{interval}s**\n⏳ Estimated total time: **{est_str}**")
             i = 0
-            next_send_time = time.monotonic() + 0.1  # immediate send for first word
+            next_send_time = time.monotonic() + 0.1
             while i < total:
-                # Only check status when paused/cancel likely, to cut DB IO
                 if i % 5 == 0 or i == 0:
-                    status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
+                    status_row = db_execute("SELECT status FROM tasks WHERE id = %s", (task_id,), fetch=True)
                     if not status_row:
                         break
-                    status = status_row[0][0]
+                    status = status_row[0]['status']
                 if status == "paused":
                     send_message(chat_id, "⏸️ **Task Paused!** Waiting for /resume to continue.")
-                    # Pause - but check every second for resume/cancel
                     while True:
                         time.sleep(1)
-                        status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
+                        status_row = db_execute("SELECT status FROM tasks WHERE id = %s", (task_id,), fetch=True)
                         if not status_row:
                             break
-                        status = status_row[0][0]
+                        status = status_row[0]['status']
                         if status == "running":
                             send_message(chat_id, "▶️ **Welcome Back!** Resuming word transmission now.")
                             break
@@ -325,6 +318,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                         break
                 if status == "cancelled":
                     break
+                # -- PRECISE TIMING
                 now = time.monotonic()
                 wait = next_send_time - now
                 if wait > 0:
@@ -332,16 +326,16 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                 send_message(chat_id, words[i])
                 i += 1
                 next_send_time += interval
-            # Done: set status accordingly
-            final_status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
-            final_status = final_status_row[0][0] if final_status_row else "done"
+            # Wrap up
+            final_status_row = db_execute("SELECT status FROM tasks WHERE id = %s", (task_id,), fetch=True)
+            final_status = final_status_row[0]['status'] if final_status_row else "done"
             if final_status != "cancelled":
                 mark_task_done(task_id)
                 record_split_log(user_id, username, total)
                 send_message(chat_id, "✅ **All Done!** Split finished successfully.")
             else:
                 send_message(chat_id, "🛑 **Active Task Stopped!** The current word transmission has been terminated.")
-            qcount_after = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
+            qcount_after = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status = 'queued'", (user_id,), fetch=True)[0][0]
             if qcount_after > 0:
                 send_message(chat_id, "⏩ **Next Task Starting Soon!** Your next queued task is ready for processing.")
     finally:
@@ -352,7 +346,7 @@ def global_worker_loop():
         try:
             rows = db_execute("SELECT DISTINCT user_id, username FROM tasks WHERE status = 'queued' ORDER BY created_at ASC", fetch=True)
             for r in rows:
-                user_id, username = r[0], r[1] or ""
+                user_id, username = r['user_id'], r['username'] or ""
                 t = threading.Thread(target=process_user_queue, args=(user_id, user_id, username), daemon=True)
                 t.start()
             time.sleep(2)
@@ -360,20 +354,20 @@ def global_worker_loop():
             traceback.print_exc()
             time.sleep(5)
 
-# Scheduler setup
+# ========== SCHEDULER ==========
 scheduler = BackgroundScheduler()
 
 def hourly_owner_stats():
     cutoff = datetime.utcnow() - timedelta(hours=1)
-    rows = db_execute("SELECT user_id, username, SUM(words) FROM split_logs WHERE created_at >= ? GROUP BY user_id", (cutoff.isoformat(),), fetch=True)
+    rows = db_execute("SELECT user_id, username, SUM(words) FROM split_logs WHERE created_at >= %s GROUP BY user_id", (cutoff.isoformat(),), fetch=True)
     if not rows:
         send_message(OWNER_ID, f"🕐 **Last 1 Hour Activity**\nNo splits in the last 1 hour.")
         return
     lines = []
     total_words = 0
     for r in rows:
-        uid = r[0]
-        wsum = int(r[2] or 0)
+        uid = r['user_id']
+        wsum = int(r['sum'] or 0) if 'sum' in r else int(r[2] or 0)
         total_words += wsum
         lines.append(f"{uid} - {wsum} words")
     body = "🕐 **Last 1 Hour Activity**\n" + "\n".join(lines) + f"\n\nTotal words: {total_words}"
@@ -398,14 +392,14 @@ scheduler.start()
 _worker_thread = threading.Thread(target=global_worker_loop, daemon=True)
 _worker_thread.start()
 
-# Flask webhook
+# ========== FLASK WEBHOOK/APIS ==========
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         update_json = request.get_json(force=True)
     except Exception:
         return "no json", 400
-
     try:
         if "message" in update_json:
             msg = update_json["message"]
@@ -424,12 +418,10 @@ def webhook():
         logger.exception("Error handling webhook update")
     return jsonify({"ok": True})
 
-# Queue size fast
 def get_queue_size(user_id):
-    q = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)
+    q = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status = 'queued'", (user_id,), fetch=True)
     return q[0][0] if q else 0
 
-# Command processing
 def handle_command(user_id: int, username: str, command: str, args: str):
     if not is_allowed(user_id) and command not in ("/start", "/help"):
         send_message(user_id, f"❌ **Sorry!** You are not allowed to use this bot. A request has been sent to the owner.")
@@ -455,30 +447,30 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True})
 
     if command == "/pause":
-        rows = db_execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
+        rows = db_execute("SELECT id FROM tasks WHERE user_id = %s AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
         if not rows:
             send_message(user_id, "❌ **Sorry!** No active task found for you to pause.")
             return jsonify({"ok": True})
-        task_id = rows[0][0]
+        task_id = rows[0]['id']
         mark_task_paused(task_id)
         send_message(user_id, "⏸️ **Task Paused!** Waiting for /resume to continue.")
         return jsonify({"ok": True})
 
     if command == "/resume":
-        rows = db_execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
+        rows = db_execute("SELECT id FROM tasks WHERE user_id = %s AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
         if not rows:
             send_message(user_id, "❌ **Sorry!** No paused task found for you to resume.")
             return jsonify({"ok": True})
-        task_id = rows[0][0]
+        task_id = rows[0]['id']
         mark_task_resumed(task_id)
         send_message(user_id, "▶️ **Welcome Back!** Resuming word transmission now.")
         return jsonify({"ok": True})
 
     if command == "/status":
-        active = db_execute("SELECT id, status, total_words, created_at FROM tasks WHERE user_id = ? AND status IN ('running','paused') ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
-        queued = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
+        active = db_execute("SELECT id, status, total_words, created_at FROM tasks WHERE user_id = %s AND status IN ('running','paused') ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
+        queued = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status = 'queued'", (user_id,), fetch=True)[0][0]
         if active:
-            aid, status, total_words, created_at = active[0]
+            aid, status, total_words, created_at = active[0]['id'], active[0]['status'], active[0]['total_words'], active[0]['created_at']
             send_message(user_id, f"📊 **Current Status Check**\nStatus: {status}\nRemaining words: {total_words}\nQueue size: {queued}")
         else:
             if queued > 0:
@@ -488,13 +480,13 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True})
 
     if command == "/stop":
-        queued_rows = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)
+        queued_rows = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status = 'queued'", (user_id,), fetch=True)
         queued_count = queued_rows[0][0] if queued_rows else 0
         stopped = cancel_active_task_for_user(user_id)
         if stopped > 0:
             send_message(user_id, f"🛑 **Active Task Stopped!** The current word transmission has been terminated. All your queued tasks have also been cleared.")
         elif queued_count > 0:
-            db_execute("UPDATE tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'queued'", (user_id,))
+            db_execute("UPDATE tasks SET status = 'cancelled' WHERE user_id = %s AND status = 'queued'", (user_id,))
             send_message(user_id, f"🛑 **Queued Tasks Cleared!** You had **{queued_count}** task(s) waiting that have been removed.")
         else:
             send_message(user_id, "ℹ️ You had no active or queued tasks.")
@@ -502,7 +494,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 
     if command == "/stats":
         cutoff = datetime.utcnow() - timedelta(hours=12)
-        rows = db_execute("SELECT SUM(words) FROM split_logs WHERE created_at >= ?", (cutoff.isoformat(),), fetch=True)
+        rows = db_execute("SELECT SUM(words) FROM split_logs WHERE created_at >= %s", (cutoff.isoformat(),), fetch=True)
         words = int(rows[0][0] or 0)
         send_message(user_id, f"🕰️ **Your Recent Activity (Last 12 Hours)**\nYou have split **{words}** words! Keep up the great work! 💪 📝")
         return jsonify({"ok": True})
@@ -535,8 +527,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if count >= MAX_ALLOWED_USERS:
             send_message(user_id, f"Cannot add more users. Max allowed users: {MAX_ALLOWED_USERS}")
             return jsonify({"ok": True})
-        db_execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
-                   (target_id, uname, get_now_iso(), 0))
+        db_execute("INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (%s, %s, %s, 0) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (target_id, uname, get_now_iso()))
         send_message(user_id, f"✅ User {target_id} added to allowed list.")
         send_message(target_id, "✅ You have been added to the Word Splitter bot. Send any text to start.")
         return jsonify({"ok": True})
@@ -553,7 +544,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         except Exception:
             send_message(user_id, "Invalid user id.")
             return jsonify({"ok": True})
-        db_execute("DELETE FROM allowed_users WHERE user_id = ?", (target_id,))
+        db_execute("DELETE FROM allowed_users WHERE user_id = %s", (target_id,))
         send_message(user_id, f"✅ User {target_id} removed from allowed list.")
         send_message(target_id, "❌ You have been removed from the Word Splitter bot. Contact owner to regain access.")
         return jsonify({"ok": True})
@@ -565,7 +556,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         rows = db_execute("SELECT user_id, username, is_admin, added_at FROM allowed_users", fetch=True)
         lines = []
         for r in rows:
-            lines.append(f"{r[0]} @{r[1] or ''} admin={bool(r[2])} added={r[3]}")
+            lines.append(f"{r['user_id']} @{r['username'] or ''} admin={bool(r['is_admin'])} added={r['added_at']}")
         body = "Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
         send_message(user_id, body)
         return jsonify({"ok": True})
@@ -577,10 +568,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         total_allowed = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
         active_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')", fetch=True)[0][0]
         queued_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'", fetch=True)[0][0]
-        rows = db_execute("SELECT user_id, SUM(words) FROM split_logs WHERE created_at >= ?", ((datetime.utcnow() - timedelta(hours=2)).isoformat(),), fetch=True)
+        rows = db_execute("SELECT user_id, SUM(words) FROM split_logs WHERE created_at >= %s", ((datetime.utcnow() - timedelta(hours=2)).isoformat(),), fetch=True)
         peruser_lines = []
         for r in rows:
-            peruser_lines.append(f"{r[0]} - {r[1] or 0}")
+            peruser_lines.append(f"{r['user_id']} - {r['sum'] or 0}")
         body = (
             f"Bot status: Online\n"
             f"Allowed users: {total_allowed}\n"
@@ -603,7 +594,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         fails = 0
         for r in rows:
             try:
-                send_message(r[0], f"📣 Broadcast from owner:\n\n{args}")
+                send_message(r['user_id'], f"📣 Broadcast from owner:\n\n{args}")
                 count += 1
             except Exception:
                 fails += 1
@@ -637,7 +628,6 @@ def handle_new_text(user_id: int, username: str, text: str):
         send_message(user_id, f"🚀 Task queued and will start shortly. Words: {res['total_words']}. Time per word: **{compute_interval(res['total_words'])}s**")
     return jsonify({"ok": True})
 
-# Misc: root forwarder, health, routes
 @app.route("/", methods=["GET", "POST"])
 def root_forward():
     if request.method == "POST":
@@ -665,7 +655,6 @@ def debug_routes():
         return jsonify({"ok": False, "error": "failed to list routes"}), 500
 
 if __name__ == "__main__":
-    # Set webhook locally if directly run
     try:
         set_webhook()
     except Exception:
