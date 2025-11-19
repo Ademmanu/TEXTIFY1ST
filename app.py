@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram Word-Splitter Bot (Webhook-ready) using PostgreSQL (V5.2).
+Telegram Word-Splitter Bot (Webhook-ready) using PostgreSQL (V5.3).
 
-Features:
-1. Full PostgreSQL implementation (psycopg2) for high concurrency.
-2. Fixes the /example command.
-3. Ensures immediate and reliable split execution via improved lock handling.
-4. Uses %s placeholders for PostgreSQL queries.
+This version contains all fixes:
+1. Full PostgreSQL implementation (psycopg2) with resilient connections.
+2. Fixes /example command.
+3. Crucial fix for Gunicorn/scheduler failure: Scheduler starts on the *first webhook request* within a worker process.
 """
 import os
 import time
@@ -45,6 +44,12 @@ if not TELEGRAM_TOKEN or not WEBHOOK_URL or not OWNER_ID or not DATABASE_URL:
     exit(1)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+# --- Global Scheduler Control (NEW FIX) ---
+_SCHEDULER_STARTED = False
+_SCHEDULER_START_LOCK = threading.Lock()
+# Initialize scheduler object, but start it later
+scheduler = BackgroundScheduler()
 
 # --- DB helper for PostgreSQL ---
 
@@ -177,7 +182,7 @@ def get_user_lock(user_id):
             user_locks[user_id] = threading.Lock()
         return user_locks[user_id]
 
-# --- Utilities ---
+# --- Utilities and Task Management (Rest of the script functions...) ---
 
 def get_now_iso():
     return datetime.utcnow().isoformat()
@@ -200,8 +205,6 @@ def is_maintenance_now() -> bool:
     if MAINTENANCE_START_HOUR_WAT < MAINTENANCE_END_HOUR_WAT:
         return MAINTENANCE_START_HOUR_WAT <= h < MAINTENANCE_END_HOUR_WAT
     return h >= MAINTENANCE_START_HOUR_WAT or h < MAINTENANCE_END_HOUR_WAT
-
-# --- Telegram API helpers (requests) ---
 
 def tg_call(method: str, payload: dict):
     if not TELEGRAM_API:
@@ -249,8 +252,6 @@ def set_webhook():
         logger.exception("Failed to set webhook")
         return None
 
-# --- Authorization helpers ---
-
 def is_allowed(user_id: int) -> bool:
     rows = db_execute("SELECT 1 FROM allowed_users WHERE user_id = %s", (user_id,), fetch=True)
     return bool(rows)
@@ -260,8 +261,6 @@ def is_admin(user_id: int) -> bool:
     if not rows:
         return False
     return bool(rows[0][0])
-
-# --- Task management ---
 
 def enqueue_task(user_id: int, username: str, text: str) -> dict:
     words = split_text_into_words(text)
@@ -284,7 +283,6 @@ def enqueue_task(user_id: int, username: str, text: str) -> dict:
     return {"ok": True, "total_words": total, "queue_size": pending + 1, "task_id": new_task_id, "words": words}
 
 def get_next_task_for_user(user_id: int) -> Optional[dict]:
-    """Retrieves the next queued task for a user."""
     rows = db_execute(
         "SELECT id, words_json, total_words, text, current_index FROM tasks WHERE user_id = %s AND status = 'queued' ORDER BY id ASC LIMIT 1",
         (user_id,),
@@ -296,7 +294,6 @@ def get_next_task_for_user(user_id: int) -> Optional[dict]:
     return {"id": r[0], "words": json.loads(r[1]), "total_words": r[2], "text": r[3], "current_index": r[4]}
 
 def get_running_task_for_user(user_id: int) -> Optional[dict]:
-    """Retrieves the active task for a user (running or paused)."""
     rows = db_execute(
         "SELECT id, words_json, total_words, text, current_index, status FROM tasks WHERE user_id = %s AND status IN ('running', 'paused') ORDER BY id ASC LIMIT 1",
         (user_id,),
@@ -316,11 +313,9 @@ def set_task_status(task_id: int, status: str):
         db_execute("UPDATE tasks SET status = %s WHERE id = %s", (status, task_id))
 
 def mark_task_paused(task_id: int, current_index: int):
-    """Sets status to paused and stores the index of the next word to send."""
     db_execute("UPDATE tasks SET status = 'paused', current_index = %s WHERE id = %s", (current_index, task_id))
 
 def mark_task_resumed(task_id: int):
-    """Sets status to running."""
     set_task_status(task_id, "running")
 
 def mark_task_done(task_id: int):
@@ -359,7 +354,6 @@ def release_user_lock_if_held(user_id: int):
     if lock.locked():
         try:
             lock.release()
-            # Immediately try to start the next task for this user
             threading.Thread(target=_start_next_queued_task_if_exists, args=(user_id, user_id, ""), daemon=True).start()
         except RuntimeError:
             pass 
@@ -440,16 +434,16 @@ def send_word_and_schedule_next(task_id: int, user_id: int, chat_id: int, words:
         set_task_status(task_id, "cancelled")
         send_message(chat_id, "❌ Critical Error: Word transmission failed unexpectedly and has been stopped.")
     finally:
-        # Crucial: Release the lock immediately after *this* scheduled job finishes its work
         if lock.locked():
              lock.release()
-             # If released due to completion/cancellation/pause, try starting the next task.
              final_status_row = db_execute("SELECT status FROM tasks WHERE id = %s", (task_id,), fetch=True)
              final_status = final_status_row[0][0] if final_status_row else "error"
              if final_status in ('done', 'cancelled'):
                  threading.Thread(target=_start_next_queued_task_if_exists, args=(user_id, user_id, username), daemon=True).start()
 
 # --- Background worker to process tasks for users ---
+
+_worker_stop = threading.Event()
 
 def _start_next_queued_task_if_exists(user_id: int, chat_id: int, username: str):
     """Acquires the lock, starts the task, and schedules the first word."""
@@ -480,7 +474,6 @@ def _start_next_queued_task_if_exists(user_id: int, chat_id: int, username: str)
         )
         send_message(chat_id, start_msg)
         
-        # Schedule the very first word immediately (0.1s delay for stability)
         scheduler.add_job(
             send_word_and_schedule_next, 
             "date", 
@@ -503,10 +496,7 @@ def _start_next_queued_task_if_exists(user_id: int, chat_id: int, username: str)
         if lock.locked():
              lock.release()
     finally:
-        # Lock is held until released by the scheduler chain or on error above
         pass
-
-_worker_stop = threading.Event()
 
 def global_worker_loop():
     """Runs less often and only checks for queued users not currently locked."""
@@ -524,9 +514,6 @@ def global_worker_loop():
             traceback.print_exc()
             time.sleep(10)
 
-# --- Scheduler Jobs ---
-scheduler = BackgroundScheduler()
-
 def delete_old_bot_messages():
     msgs = get_messages_older_than(days=1)
     for m in msgs:
@@ -535,17 +522,29 @@ def delete_old_bot_messages():
         except Exception:
             db_execute("UPDATE sent_messages SET deleted = TRUE WHERE chat_id = %s AND message_id = %s", (m["chat_id"], m["message_id"]))
 
-scheduler.add_job(lambda: send_message(OWNER_ID, "Health Check"), "interval", hours=1) 
-scheduler.add_job(delete_old_bot_messages, "interval", minutes=30)
-scheduler.start()
-
-_worker_thread = threading.Thread(target=global_worker_loop, daemon=True)
-_worker_thread.start()
-
 # --- Flask Webhook and Command Handlers ---
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # --- CRITICAL FIX: Ensure scheduler starts only inside the worker process ---
+    global _SCHEDULER_STARTED
+    with _SCHEDULER_START_LOCK:
+        if not _SCHEDULER_STARTED:
+            logger.info("Starting scheduler and worker loop inside first Gunicorn worker process.")
+            
+            # Add jobs and start scheduler
+            scheduler.add_job(lambda: send_message(OWNER_ID, "Health Check"), "interval", hours=1) 
+            scheduler.add_job(delete_old_bot_messages, "interval", minutes=30)
+            scheduler.start()
+            
+            # Start the background worker thread for queued tasks
+            global _worker_thread
+            _worker_thread = threading.Thread(target=global_worker_loop, daemon=True)
+            _worker_thread.start()
+            
+            _SCHEDULER_STARTED = True
+    # --------------------------------------------------------------------------
+
     try:
         update_json = request.get_json(force=True)
     except Exception:
@@ -708,7 +707,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         rows = db_execute("SELECT user_id, username, is_admin, added_at FROM allowed_users", fetch=True) 
         lines = [] 
         for r in rows: 
-             # Check if r[3] is a datetime object, convert it to isoformat if it is
             date_str = r[3].isoformat() if isinstance(r[3], datetime) else str(r[3])
             lines.append(f"{r[0]} @{r[1] or ''} admin={r[2]} added={date_str}") 
         body = "Allowed users:\n" + ("\n".join(lines) if lines else "(none)") 
@@ -768,7 +766,6 @@ def handle_new_text(user_id: int, username: str, text: str):
     qsize = get_queue_size(user_id)
     
     if qsize == 1:
-        # CRITICAL START: Start the first task immediately
         threading.Thread(target=_start_next_queued_task_if_exists, args=(user_id, user_id, username), daemon=True).start()
         send_message(user_id, f"🚀 Task queued and **starting now**. Words: {res['total_words']}. Time per word: {compute_interval(res['total_words'])}s")
     else:
@@ -802,6 +799,7 @@ def health():
 
 if __name__ == "__main__":
     try:
+        # Note: Scheduler is NOT started here, but inside the first webhook call.
         set_webhook()
     except Exception:
         logger.exception("Failed to set webhook at startup")
