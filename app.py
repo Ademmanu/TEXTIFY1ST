@@ -362,7 +362,6 @@ scheduler = BackgroundScheduler()
 
 def hourly_owner_stats():
     cutoff = datetime.utcnow() - timedelta(hours=1)
-    # FIX: username must be aggregated or grouped!
     rows = db_execute("""
         SELECT user_id, MAX(username) AS username, SUM(words)
         FROM split_logs
@@ -433,12 +432,210 @@ def get_queue_size(user_id):
     return q[0][0] if q else 0
 
 def handle_command(user_id: int, username: str, command: str, args: str):
-    # ... (same as above! no changes to logic) ...
-    # (truncated for brevity; see previous script for full command block)
+    if not is_allowed(user_id) and command not in ("/start", "/help"):
+        send_message(user_id, f"❌ **Sorry!** You are not allowed to use this bot. A request has been sent to the owner.")
+        send_message(OWNER_ID, f"⚠️ Unallowed access attempt by @{username or user_id} ({user_id}). Message: {args or '[no text]'}")
+        return jsonify({"ok": True})
+    if command == "/start":
+        body = (
+            f"👋 **Welcome, @{username or user_id}!**\n"
+            "I split your text into individual word messages. Commands:\n"
+            "/start /example /pause /resume /status /stop /stats /about\n"
+            "Owner-only: /adduser /removeuser /listusers /botinfo /broadcast\n"
+            "How to use: send any text to split it into words."
+        )
+        send_message(user_id, body)
+        return jsonify({"ok": True})
+
+    if command == "/example":
+        sample = "This is a demo split"
+        send_message(user_id, "Running example split...")
+        enqueue_task(user_id, username, sample)
+        send_message(user_id, f"📝 **Queued!** You currently have **{get_queue_size(user_id)}** task(s) waiting in line. Your current task must finish first.")
+        return jsonify({"ok": True})
+
+    if command == "/pause":
+        rows = db_execute("SELECT id FROM tasks WHERE user_id = %s AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
+        if not rows:
+            send_message(user_id, "❌ **Sorry!** No active task found for you to pause.")
+            return jsonify({"ok": True})
+        task_id = rows[0]['id']
+        mark_task_paused(task_id)
+        send_message(user_id, "⏸️ **Task Paused!** Waiting for /resume to continue.")
+        return jsonify({"ok": True})
+
+    if command == "/resume":
+        rows = db_execute("SELECT id FROM tasks WHERE user_id = %s AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
+        if not rows:
+            send_message(user_id, "❌ **Sorry!** No paused task found for you to resume.")
+            return jsonify({"ok": True})
+        task_id = rows[0]['id']
+        mark_task_resumed(task_id)
+        send_message(user_id, "▶️ **Welcome Back!** Resuming word transmission now.")
+        return jsonify({"ok": True})
+
+    if command == "/status":
+        active = db_execute("SELECT id, status, total_words, created_at FROM tasks WHERE user_id = %s AND status IN ('running','paused') ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
+        queued = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status = 'queued'", (user_id,), fetch=True)[0][0]
+        if active:
+            aid, status, total_words, created_at = active[0]['id'], active[0]['status'], active[0]['total_words'], active[0]['created_at']
+            send_message(user_id, f"📊 **Current Status Check**\nStatus: {status}\nRemaining words: {total_words}\nQueue size: {queued}")
+        else:
+            if queued > 0:
+                send_message(user_id, f"📝 **Status: Waiting.** Your first task is waiting in line. Queue size: {queued}")
+            else:
+                send_message(user_id, "📊 You have no active or queued tasks.")
+        return jsonify({"ok": True})
+
+    if command == "/stop":
+        queued_rows = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status = 'queued'", (user_id,), fetch=True)
+        queued_count = queued_rows[0][0] if queued_rows else 0
+        stopped = cancel_active_task_for_user(user_id)
+        if stopped > 0:
+            send_message(user_id, f"🛑 **Active Task Stopped!** The current word transmission has been terminated. All your queued tasks have also been cleared.")
+        elif queued_count > 0:
+            db_execute("UPDATE tasks SET status = 'cancelled' WHERE user_id = %s AND status = 'queued'", (user_id,))
+            send_message(user_id, f"🛑 **Queued Tasks Cleared!** You had **{queued_count}** task(s) waiting that have been removed.")
+        else:
+            send_message(user_id, "ℹ️ You had no active or queued tasks.")
+        return jsonify({"ok": True})
+
+    if command == "/stats":
+        cutoff = datetime.utcnow() - timedelta(hours=12)
+        rows = db_execute("SELECT SUM(words) FROM split_logs WHERE created_at >= %s", (cutoff.isoformat(),), fetch=True)
+        words = int(rows[0][0] or 0)
+        send_message(user_id, f"🕰️ **Your Recent Activity (Last 12 Hours)**\nYou have split **{words}** words! Keep up the great work! 💪 📝")
+        return jsonify({"ok": True})
+
+    if command == "/about":
+        body = (
+            "*About This Bot*\n"
+            "I split texts into individual word messages. Speed control is dynamic based on total words.\n"
+            "Features: queueing, pause/resume, maintenance window, hourly owner stats, auto-delete bot messages older than 24h.\n"
+            f"Developer: @{OWNER_USERNAME}"
+        )
+        send_message(user_id, body)
+        return jsonify({"ok": True})
+
+    if command == "/adduser":
+        if not is_admin(user_id):
+            send_message(user_id, "❌ You are not allowed to use this command.")
+            return jsonify({"ok": True})
+        if not args:
+            send_message(user_id, "Usage: /adduser <telegram_user_id> [username]")
+            return jsonify({"ok": True})
+        parts = args.split()
+        try:
+            target_id = int(parts[0])
+        except Exception:
+            send_message(user_id, "Invalid user id. Must be numeric.")
+            return jsonify({"ok": True})
+        uname = parts[1] if len(parts) > 1 else ""
+        count = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
+        if count >= MAX_ALLOWED_USERS:
+            send_message(user_id, f"Cannot add more users. Max allowed users: {MAX_ALLOWED_USERS}")
+            return jsonify({"ok": True})
+        db_execute("INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (%s, %s, %s, 0) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", (target_id, uname, get_now_iso()))
+        send_message(user_id, f"✅ User {target_id} added to allowed list.")
+        send_message(target_id, "✅ You have been added to the Word Splitter bot. Send any text to start.")
+        return jsonify({"ok": True})
+
+    if command == "/removeuser":
+        if not is_admin(user_id):
+            send_message(user_id, "❌ You are not allowed to use this command.")
+            return jsonify({"ok": True})
+        if not args:
+            send_message(user_id, "Usage: /removeuser <telegram_user_id>")
+            return jsonify({"ok": True})
+        try:
+            target_id = int(args.split()[0])
+        except Exception:
+            send_message(user_id, "Invalid user id.")
+            return jsonify({"ok": True})
+        db_execute("DELETE FROM allowed_users WHERE user_id = %s", (target_id,))
+        send_message(user_id, f"✅ User {target_id} removed from allowed list.")
+        send_message(target_id, "❌ You have been removed from the Word Splitter bot. Contact owner to regain access.")
+        return jsonify({"ok": True})
+
+    if command == "/listusers":
+        if not is_admin(user_id):
+            send_message(user_id, "❌ You are not allowed to use this command.")
+            return jsonify({"ok": True})
+        rows = db_execute("SELECT user_id, username, is_admin, added_at FROM allowed_users", fetch=True)
+        lines = []
+        for r in rows:
+            lines.append(f"{r['user_id']} @{r['username'] or ''} admin={bool(r['is_admin'])} added={r['added_at']}")
+        body = "Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
+        send_message(user_id, body)
+        return jsonify({"ok": True})
+
+    if command == "/botinfo":
+        if user_id != OWNER_ID:
+            send_message(user_id, "❌ Only the bot owner can use /botinfo")
+            return jsonify({"ok": True})
+        total_allowed = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
+        active_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')", fetch=True)[0][0]
+        queued_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'", fetch=True)[0][0]
+        rows = db_execute("SELECT user_id, SUM(words) FROM split_logs WHERE created_at >= %s", ((datetime.utcnow() - timedelta(hours=2)).isoformat(),), fetch=True)
+        peruser_lines = []
+        for r in rows:
+            peruser_lines.append(f"{r['user_id']} - {r['sum'] or 0}")
+        body = (
+            f"Bot status: Online\n"
+            f"Allowed users: {total_allowed}\n"
+            f"Active tasks: {active_tasks}\n"
+            f"Queued tasks: {queued_tasks}\n"
+            f"User stats (last 2h):\n" + ("\n".join(peruser_lines) if peruser_lines else "No activity")
+        )
+        send_message(user_id, body)
+        return jsonify({"ok": True})
+
+    if command == "/broadcast":
+        if user_id != OWNER_ID:
+            send_message(user_id, "❌ Only owner can broadcast")
+            return jsonify({"ok": True})
+        if not args:
+            send_message(user_id, "Usage: /broadcast <message>")
+            return jsonify({"ok": True})
+        rows = db_execute("SELECT user_id FROM allowed_users", fetch=True)
+        count = 0
+        fails = 0
+        for r in rows:
+            try:
+                send_message(r['user_id'], f"📣 Broadcast from owner:\n\n{args}")
+                count += 1
+            except Exception:
+                fails += 1
+        send_message(user_id, f"Broadcast complete. Success: {count}, Failed: {fails}")
+        return jsonify({"ok": True})
+
+    send_message(user_id, "Unknown command.")
+    return jsonify({"ok": True})
+
 
 def handle_new_text(user_id: int, username: str, text: str):
-    # ... (same as above! no changes to logic) ...
-    # (truncated for brevity; see previous script for full block)
+    if not is_allowed(user_id):
+        send_message(user_id, "❌ **Sorry!** You are not allowed to use this bot. A request has been sent to the owner.")
+        send_message(OWNER_ID, f"⚠️ Unallowed access attempt by @{username or user_id} ({user_id}). Message: {text}")
+        return jsonify({"ok": True})
+    if is_maintenance_now():
+        send_message(user_id, "🛠️ **Maintenance in Progress!** New tasks are blocked. Please try again after 4 AM WAT.")
+        send_message(OWNER_ID, f"🛠️ Maintenance attempted during window by {user_id}.")
+        return jsonify({"ok": True})
+    res = enqueue_task(user_id, username, text)
+    if not res["ok"]:
+        if res.get("reason") == "empty":
+            send_message(user_id, "Empty or whitespace-only text. Nothing to split.")
+            return jsonify({"ok": True})
+        if res.get("reason") == "queue_full":
+            send_message(user_id, f"❌ Your queue is full ({res['queue_size']}). Please /stop or wait for tasks to finish.")
+            return jsonify({"ok": True})
+    qsize = get_queue_size(user_id)
+    if qsize > 1:
+        send_message(user_id, f"📝 **Queued!** You currently have **{qsize}** task(s) waiting in line. Your current task must finish first.")
+    else:
+        send_message(user_id, f"🚀 Task queued and will start shortly. Words: {res['total_words']}. Time per word: **{compute_interval(res['total_words'])}s**")
+    return jsonify({"ok": True})
 
 @app.route("/", methods=["GET", "POST"])
 def root_forward():
