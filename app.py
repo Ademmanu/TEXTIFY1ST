@@ -2,33 +2,13 @@
 """
 Telegram Word-Splitter Bot (Webhook-ready) - app.py V5
 
-This file is your current app.py updated to include a robust, rate-aware tg_call
-implementation to avoid the HTTPError 429 "Too Many Requests" exceptions you saw.
+Updated: /botinfo now shows:
+ - general bot summary (allowed users, active/queued tasks)
+ - Users with active tasks (running/paused) including remaining words and counts
+ - User stats (last 1 hour) sorted by words split
 
-What I changed:
-- Replaced the previous tg_call with a robust version that:
-  - Uses a global token-bucket (token refill rate = MAX_MSG_PER_SECOND) to throttle outbound requests.
-  - Enforces a minimum global rate of 50 messages/sec (configurable via MAX_MSG_PER_SECOND env var,
-    but never below 50 as requested earlier).
-  - Parses Telegram 429 responses for "retry_after" and respects it.
-  - Retries transient network/server errors with exponential backoff.
-  - Avoids calling resp.raise_for_status() before reading JSON so we can read retry info.
-- Kept the rest of your app.py code intact (DB, tasks, workers, Flask endpoints) except for minimal
-  surrounding adjustments to integrate the new tg_call.
-- Added a small internal counter for 429 occurrences for monitoring.
-
-How this prevents the error you saw:
-- Instead of raising HTTPError on 429 (which lost the retry information),
-  tg_call now reads the response JSON, extracts retry_after, sleeps accordingly,
-  and retries. It also ensures the bot does not exceed the configured global send
-  rate, preventing repeated 429s.
-
-Run with:
-  gunicorn app:app --bind 0.0.0.0:$PORT
-
-Notes:
-- If you want confirmations/admin replies prioritized over word messages (to keep UX snappy under heavy load),
-  I can add a prioritized sender queue next. For now this change focuses on robustly handling rate limits.
+Also contains the robust tg_call and rate-limiter already added in V5.
+Run with: gunicorn app:app --bind 0.0.0.0:$PORT
 """
 import os
 import time
@@ -805,20 +785,63 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if user_id != OWNER_ID:
             send_message(user_id, "❌ Only the bot owner can use /botinfo")
             return jsonify({"ok": True})
+        # General counts
         total_allowed = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
         active_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')", fetch=True)[0][0]
         queued_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'", fetch=True)[0][0]
-        rows = db_execute("SELECT user_id, SUM(words) FROM split_logs WHERE created_at >= ?", ((datetime.utcnow() - timedelta(hours=1)).isoformat(),), fetch=True)
-        peruser_lines = []
-        for r in rows:
-            peruser_lines.append(f"{r[0]} - {r[1] or 0}")
-        body = (
-            f"Bot status: Online\n"
-            f"Allowed users: {total_allowed}\n"
-            f"Active tasks: {active_tasks}\n"
-            f"Queued tasks: {queued_tasks}\n"
-            f"User stats (last 1h):\n" + ("\n".join(peruser_lines) if peruser_lines else "No activity")
+
+        # Users with active tasks (running or paused): compute remaining words and active task count per user
+        # remaining_words = SUM(total_words - sent_count)
+        active_rows = db_execute(
+            "SELECT user_id, username, SUM(total_words - IFNULL(sent_count,0)) as remaining_words, COUNT(*) as active_count "
+            "FROM tasks WHERE status IN ('running','paused') GROUP BY user_id ORDER BY remaining_words DESC",
+            fetch=True,
         )
+        # Queued counts grouped per user (so we can show queued along with active)
+        queued_rows = db_execute(
+            "SELECT user_id, COUNT(*) as queued_count FROM tasks WHERE status = 'queued' GROUP BY user_id",
+            fetch=True,
+        )
+        queued_map = {r[0]: int(r[1]) for r in queued_rows}
+
+        peruser_active_lines = []
+        for r in active_rows:
+            uid = r[0]
+            uname = r[1] or ""
+            remaining_words = int(r[2] or 0)
+            active_count = int(r[3] or 0)
+            queued_count = queued_map.get(uid, 0)
+            name_part = f" ({uname})" if uname else ""
+            peruser_active_lines.append(f"{uid}{name_part} - {remaining_words} remaining - {active_count} active - {queued_count} queued")
+
+        # User stats for last 1 hour
+        cutoff = datetime.utcnow() - timedelta(hours=1)
+        stats_rows = db_execute(
+            "SELECT user_id, username, SUM(words) as s FROM split_logs WHERE created_at >= ? GROUP BY user_id ORDER BY s DESC",
+            (cutoff.isoformat(),),
+            fetch=True,
+        )
+        stats_lines = []
+        for r in stats_rows:
+            uid = r[0]
+            uname = r[1] or ""
+            wsum = int(r[2] or 0)
+            stats_lines.append(f"{uid}{(' (' + uname + ')') if uname else ''} - {wsum} words")
+
+        # Build body: include both sections and general info
+        body_parts = [
+            "Bot status: Online",
+            f"Allowed users: {total_allowed}",
+            f"Active tasks: {active_tasks}",
+            f"Queued tasks: {queued_tasks}",
+            "",
+            "Users with active tasks:",
+            "\n".join(peruser_active_lines) if peruser_active_lines else "No active users",
+            "",
+            "User stats (last 1h):",
+            "\n".join(stats_lines) if stats_lines else "No activity in the last 1h",
+        ]
+        body = "\n".join(body_parts)
         send_message(user_id, body)
         return jsonify({"ok": True})
 
