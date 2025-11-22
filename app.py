@@ -8,9 +8,9 @@ Changes in this version:
 - Admins are able to use /adduser and /listusers (unchanged behavior; preserved).
 - /removeuser can remove any user (including admins) from allowed_users.
 - All other behavior kept as in the previous app.py (tg_call rate-limiter, botinfo showing active users and last-1h stats, etc.)
-- Persistence improvements: default DB_PATH moved to /data/botdata.sqlite3; SQLite WAL mode enabled.
-- handle_update function added and used by both /webhook and root forward endpoints.
-- /adduser now accepts multiple user ids in one command (with optional per-id username).
+
+Run with:
+    gunicorn app:app --bind 0.0.0.0:$PORT
 """
 import os
 import time
@@ -42,8 +42,7 @@ MAX_ALLOWED_USERS = int(os.environ.get("MAX_ALLOWED_USERS", "50"))
 MAX_QUEUE_PER_USER = int(os.environ.get("MAX_QUEUE_PER_USER", "50"))
 MAINTENANCE_START_HOUR_WAT = 3  # 03:00 WAT
 MAINTENANCE_END_HOUR_WAT = 4    # 04:00 WAT
-# NOTE: Default DB path changed to /data/botdata.sqlite3 so you can mount a persistent disk at /data on Render.
-DB_PATH = os.environ.get("DB_PATH", "/data/botdata.sqlite3")
+DB_PATH = os.environ.get("DB_PATH", "botdata.sqlite3")
 REQUESTS_TIMEOUT = float(os.environ.get("REQUESTS_TIMEOUT", "10"))
 
 # Rate-limit and retry configuration (minimum enforced earlier)
@@ -65,24 +64,8 @@ _db_lock = threading.Lock()
 
 
 def init_db():
-    # Ensure directory exists for DB path (useful when mounting volume)
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir and not os.path.exists(db_dir):
-        try:
-            os.makedirs(db_dir, exist_ok=True)
-        except Exception:
-            logger.exception("Could not create DB directory %s", db_dir)
-
-    # Use a longer timeout to reduce "database is locked" errors under concurrency
-    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        # turn on WAL for better concurrent reads/writes
-        try:
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=NORMAL")
-        except Exception:
-            logger.exception("Failed to set PRAGMA on sqlite DB")
-
         # allowed users table
         c.execute(
             """
@@ -139,19 +122,19 @@ def init_db():
         conn.commit()
 
         # Migration: ensure sent_count column exists (for older DBs)
-        try:
-            c.execute("PRAGMA table_info(tasks)")
-            cols = [r[1] for r in c.fetchall()]
-            if "sent_count" not in cols:
+        c.execute("PRAGMA table_info(tasks)")
+        cols = [r[1] for r in c.fetchall()]
+        if "sent_count" not in cols:
+            try:
                 c.execute("ALTER TABLE tasks ADD COLUMN sent_count INTEGER DEFAULT 0")
                 conn.commit()
                 logger.info("Migrated tasks table: added sent_count")
-        except Exception:
-            logger.exception("Failed to inspect/migrate tasks table")
+            except Exception:
+                logger.exception("Failed to add sent_count column (maybe already present)")
 
 
 def db_execute(query, params=(), fetch=False):
-    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(query, params)
         if fetch:
@@ -597,11 +580,15 @@ _worker_thread = threading.Thread(target=global_worker_loop, daemon=True)
 _worker_thread.start()
 
 
-# New: central update processor shared by /webhook and root forward
-def handle_update(update_json):
+# Webhook endpoint
+@app.route("/webhook", methods=["POST"])
+def webhook():
     try:
-        if not isinstance(update_json, dict):
-            return
+        update_json = request.get_json(force=True)
+    except Exception:
+        return "no json", 400
+
+    try:
         if "message" in update_json:
             msg = update_json["message"]
             user = msg.get("from", {})
@@ -612,32 +599,9 @@ def handle_update(update_json):
                 parts = text.split(None, 1)
                 command = parts[0].split("@")[0].lower()
                 args = parts[1] if len(parts) > 1 else ""
-                # use the same handler as the webhook endpoint
-                try:
-                    # handle_command returns a Flask response object; we don't use it here
-                    handle_command(user_id, username, command, args)
-                except Exception:
-                    logger.exception("Error while handling command in background")
+                return handle_command(user_id, username, command, args)
             else:
-                try:
-                    handle_new_text(user_id, username, text)
-                except Exception:
-                    logger.exception("Error while handling text in background")
-    except Exception:
-        logger.exception("Unhandled exception in handle_update")
-
-
-# Webhook endpoint
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        update_json = request.get_json(force=True)
-    except Exception:
-        return "no json", 400
-
-    try:
-        # process synchronously
-        handle_update(update_json)
+                return handle_new_text(user_id, username, text)
     except Exception:
         logger.exception("Error handling webhook update")
     return jsonify({"ok": True})
@@ -743,52 +707,23 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /adduser <telegram_user_id> [username] [<telegram_user_id2> [username2] ...]")
+            send_message(user_id, "Usage: /adduser <telegram_user_id> [username]")
             return jsonify({"ok": True})
-        tokens = args.split()
-        added = []
-        skipped = []
-        i = 0
+        parts = args.split()
         try:
-            total_current = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
+            target_id = int(parts[0])
         except Exception:
-            total_current = 0
-        while i < len(tokens):
-            tok = tokens[i]
-            try:
-                target_id = int(tok)
-            except Exception:
-                # skip token that is not a numeric id
-                skipped.append(tok)
-                i += 1
-                continue
-            # optional username next
-            uname = ""
-            if i + 1 < len(tokens):
-                next_tok = tokens[i + 1]
-                # treat next token as username if it's not purely numeric (so next id won't be consumed incorrectly)
-                if not re.fullmatch(r"\d+", next_tok):
-                    uname = next_tok
-                    i += 1
-            # check capacity
-            if total_current >= MAX_ALLOWED_USERS:
-                skipped.append(str(target_id))
-                i += 1
-                continue
-            try:
-                db_execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
-                           (target_id, uname, get_now_iso(), 0))
-                send_message(target_id, "✅ You have been added. Send any text to start.")
-                added.append(target_id)
-                total_current += 1
-            except Exception:
-                logger.exception("Failed to add user %s", target_id)
-                skipped.append(str(target_id))
-            i += 1
-        summary = f"Added: {added}" if added else "No users added."
-        if skipped:
-            summary += f" Skipped/failed: {skipped}"
-        send_message(user_id, f"✅ /adduser result: {summary}")
+            send_message(user_id, "Invalid user id. Must be numeric.")
+            return jsonify({"ok": True})
+        uname = parts[1] if len(parts) > 1 else ""
+        count = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
+        if count >= MAX_ALLOWED_USERS:
+            send_message(user_id, f"Cannot add more users. Max: {MAX_ALLOWED_USERS}")
+            return jsonify({"ok": True})
+        db_execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                   (target_id, uname, get_now_iso(), 0))
+        send_message(user_id, f"✅ User {target_id} added.")
+        send_message(target_id, "✅ You have been added. Send any text to start.")
         return jsonify({"ok": True})
 
     if command == "/removeuser":
@@ -998,7 +933,7 @@ def handle_new_text(user_id: int, username: str, text: str):
 @app.route("/", methods=["GET", "POST"])
 def root_forward():
     if request.method == "POST":
-        logger.info("Received POST at root; forwarding to /webhook (background)")
+        logger.info("Received POST at root; forwarding to /webhook")
         try:
             update_json = request.get_json(force=True)
             threading.Thread(target=handle_update, args=(update_json,), daemon=True).start()
