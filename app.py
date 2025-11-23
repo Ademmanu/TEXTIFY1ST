@@ -12,6 +12,8 @@ Changes in this version relative to the provided file:
   - Suspensions are honored in permission checks (is_allowed) and expire automatically (lazy cleanup on check).
 - Kept /adduser (admin command) for adding users (batch adds supported).
 - All other functionality preserved.
+- New: support ALLOWED_USERS env var (comma/space separated ids). These IDs are inserted into allowed_users
+  on startup and behave like users added with /adduser (they can be suspended by owners).
 """
 import os
 import time
@@ -200,6 +202,43 @@ try:
                 )
             else:
                 db_execute("UPDATE allowed_users SET is_admin = 1 WHERE user_id = ?", (oid,))
+
+    # Add any preconfigured allowed users from ALLOWED_USERS env var (comma/space separated ids).
+    # These behave like users added with /adduser and therefore can be suspended by the owner.
+    _allowed_users_raw = os.environ.get("ALLOWED_USERS", "")
+    if _allowed_users_raw:
+        ids = [p.strip() for p in re.split(r"[,\s]+", _allowed_users_raw) if p and p.strip().isdigit()]
+        try:
+            current_total = int(db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0])
+        except Exception:
+            current_total = 0
+        added_env = []
+        for pid in ids:
+            try:
+                uid = int(pid)
+            except Exception:
+                continue
+            # skip if owner already present (owners are already ensured above)
+            if uid in OWNERS:
+                continue
+            exists = db_execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (uid,), fetch=True)
+            if exists:
+                continue
+            if current_total >= MAX_ALLOWED_USERS:
+                logger.warning("Skipping ALLOWED_USERS %s: max allowed users (%d) reached", uid, MAX_ALLOWED_USERS)
+                break
+            try:
+                db_execute(
+                    "INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                    (uid, "", get_now_iso(), 0),
+                )
+                added_env.append(uid)
+                current_total += 1
+            except Exception:
+                logger.exception("Failed to add ALLOWED_USERS id %s from env", uid)
+        if added_env:
+            logger.info("Added ALLOWED_USERS from environment: %s", ", ".join(str(x) for x in added_env))
+
 except Exception:
     logger.exception("Error ensuring owners in allowed_users")
 
