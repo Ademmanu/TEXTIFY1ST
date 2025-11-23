@@ -2,19 +2,16 @@
 """
 Telegram Word-Splitter Bot (Webhook-ready) - app.py (updated)
 
-Changes in this version:
-- /stats now shows only the requesting user's words split in the last 12 hours.
-- /addadmin command added (owner-only) to grant admin rights to a user.
-- Admins are able to use /adduser and /listusers (unchanged behavior; preserved).
-- /removeuser can remove any user (including admins) from allowed_users.
-- All other behavior kept as in the previous app.py (tg_call rate-limiter, botinfo showing active users and last-1h stats, etc.)
-- FIXES:
-  - more robust SQLite access with retries on "database is locked" (prevents intermittent failures when multiple requests/threads
-    write to the DB at once).
-  - improved /adduser: accepts multiple user ids in a single command (space- or comma-separated), reports which were added,
-    which already existed, and which failed. This avoids the "only first few added then repeats" symptom caused by race/lock
-    problems and gives clear feedback to the admin.
-  - clearer DB connect timeout to help avoid SQLITE_BUSY failures.
+Changes in this version relative to the provided file:
+- Support multiple owners via OWNER_IDS env var (comma-separated). Backwards-compatible with single OWNER_ID.
+- Removed commands: /addadmin, /removeadmin, /removeuser (owner/admin cannot remove users via bot anymore).
+- Added suspension subsystem:
+  - New DB table suspended_users to store suspensions with expiry.
+  - Owner-only commands: /suspend <user_id> [duration] and /unsuspend <user_id>.
+  - /listsuspended command (admins + owners) to view current suspensions.
+  - Suspensions are honored in permission checks (is_allowed) and expire automatically (lazy cleanup on check).
+- Kept /adduser (admin command) for adding users (batch adds supported).
+- All other functionality preserved.
 """
 import os
 import time
@@ -40,7 +37,16 @@ app = Flask(__name__)
 # Configuration via environment variables
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # full https URL for webhook
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))  # numeric Telegram user id
+
+# Support multiple owners via OWNER_IDS (comma-separated). Backwards-compatible with single OWNER_ID.
+_owner_ids_raw = os.environ.get("OWNER_IDS")
+if not _owner_ids_raw:
+    _owner_ids_raw = os.environ.get("OWNER_ID", "0")
+_owner_ids_list = [p.strip() for p in re.split(r"[,\s]+", _owner_ids_raw) if p and p.strip().isdigit()]
+OWNERS = set(int(p) for p in _owner_ids_list) if _owner_ids_list else set()
+# Primary owner for legacy places expecting a single OWNER_ID
+OWNER_ID = next(iter(OWNERS)) if OWNERS else 0
+
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "justmemmy")
 MAX_ALLOWED_USERS = int(os.environ.get("MAX_ALLOWED_USERS", "50"))
 MAX_QUEUE_PER_USER = int(os.environ.get("MAX_QUEUE_PER_USER", "50"))
@@ -56,7 +62,7 @@ TG_CALL_MAX_RETRIES = int(os.environ.get("TG_CALL_MAX_RETRIES", "5"))
 TG_CALL_MAX_BACKOFF = float(os.environ.get("TG_CALL_MAX_BACKOFF", "60"))  # seconds
 
 if not TELEGRAM_TOKEN or not WEBHOOK_URL or not OWNER_ID:
-    logger.warning("TELEGRAM_TOKEN, WEBHOOK_URL, OWNER_ID should be set in environment.")
+    logger.warning("TELEGRAM_TOKEN, WEBHOOK_URL, OWNER_ID (or OWNER_IDS) should be set in environment.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else None
 
@@ -123,6 +129,18 @@ def init_db():
             )
             """
         )
+        # suspended users table (user_id -> suspended_until ISO timestamp)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS suspended_users (
+                user_id INTEGER PRIMARY KEY,
+                suspended_until TEXT,
+                reason TEXT,
+                added_by INTEGER,
+                added_at TEXT
+            )
+            """
+        )
         conn.commit()
 
         # Migration: ensure sent_count column exists (for older DBs)
@@ -168,17 +186,22 @@ def db_execute(query, params=(), fetch=False, retries=6):
             raise
 
 
-# Initialize DB and ensure owner is allowed/admin
+# Initialize DB and ensure owners are allowed/admin
 init_db()
 try:
-    res = db_execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (OWNER_ID,), fetch=True)
-    if not res:
-        db_execute(
-            "INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
-            (OWNER_ID, OWNER_USERNAME, datetime.utcnow().isoformat(), 1),
-        )
+    # Ensure each owner present as admin in allowed_users
+    if OWNERS:
+        for oid in OWNERS:
+            res = db_execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (oid,), fetch=True)
+            if not res:
+                db_execute(
+                    "INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                    (oid, OWNER_USERNAME, datetime.utcnow().isoformat(), 1),
+                )
+            else:
+                db_execute("UPDATE allowed_users SET is_admin = 1 WHERE user_id = ?", (oid,))
 except Exception:
-    logger.exception("Error ensuring owner in allowed_users")
+    logger.exception("Error ensuring owners in allowed_users")
 
 
 # In-memory per-user locks to guarantee single active worker per user (persisted states in DB)
@@ -462,13 +485,97 @@ def get_messages_older_than(days=1):
     return res
 
 
+# Suspension helpers
+def parse_duration_to_seconds(s: str) -> int:
+    """
+    Parse simple duration strings like:
+      3600, 1h, 30m, 1h30m, 2d, 45s
+    Returns seconds (int). On parse failure returns None.
+    """
+    if not s:
+        return None
+    s = s.strip().lower()
+    # pure integer seconds
+    if s.isdigit():
+        return int(s)
+    total = 0
+    # find all groups like "1h", "30m"
+    for m in re.finditer(r"(\d+)([smhd])", s):
+        val = int(m.group(1))
+        unit = m.group(2)
+        if unit == "s":
+            total += val
+        elif unit == "m":
+            total += val * 60
+        elif unit == "h":
+            total += val * 3600
+        elif unit == "d":
+            total += val * 86400
+    return total if total > 0 else None
+
+
+def suspend_user_in_db(target_id: int, until_iso: str, added_by: int, reason: str = ""):
+    db_execute(
+        "INSERT OR REPLACE INTO suspended_users (user_id, suspended_until, reason, added_by, added_at) VALUES (?, ?, ?, ?, ?)",
+        (target_id, until_iso, reason or "", added_by, get_now_iso()),
+    )
+
+
+def unsuspend_user_in_db(target_id: int):
+    db_execute("DELETE FROM suspended_users WHERE user_id = ?", (target_id,))
+
+
+def get_suspended_row(target_id: int):
+    rows = db_execute("SELECT suspended_until, reason, added_by, added_at FROM suspended_users WHERE user_id = ?", (target_id,), fetch=True)
+    return rows[0] if rows else None
+
+
+def cleanup_expired_suspensions():
+    # Remove any suspended rows where suspended_until <= now
+    now_iso = get_now_iso()
+    db_execute("DELETE FROM suspended_users WHERE suspended_until <= ?", (now_iso,))
+
+
+def is_suspended(user_id: int) -> bool:
+    # Owners are never suspended (owner override)
+    if user_id in OWNERS:
+        return False
+    rows = db_execute("SELECT suspended_until FROM suspended_users WHERE user_id = ?", (user_id,), fetch=True)
+    if not rows:
+        return False
+    suspended_until = rows[0][0]
+    if not suspended_until:
+        return False
+    try:
+        until = datetime.fromisoformat(suspended_until)
+    except Exception:
+        # if bad data, remove row and treat as not suspended
+        logger.warning("Bad suspended_until format for user %s: %s", user_id, suspended_until)
+        unsuspend_user_in_db(user_id)
+        return False
+    if datetime.utcnow() >= until:
+        # expired -> cleanup and not suspended
+        unsuspend_user_in_db(user_id)
+        return False
+    return True
+
+
 # Authorization helpers
 def is_allowed(user_id: int) -> bool:
+    # Owners always allowed
+    if user_id in OWNERS:
+        return True
+    # Suspended users are not allowed
+    if is_suspended(user_id):
+        return False
     rows = db_execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,), fetch=True)
     return bool(rows)
 
 
 def is_admin(user_id: int) -> bool:
+    # Owners are admins
+    if user_id in OWNERS:
+        return True
     rows = db_execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,), fetch=True)
     if not rows:
         return False
@@ -488,6 +595,16 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             task = get_next_task_for_user(user_id)
             if not task:
                 break
+            # If user became suspended while tasks queued, cancel their tasks
+            if is_suspended(user_id):
+                # cancel all queued/running/paused tasks for this user and notify them
+                stopped = cancel_active_task_for_user(user_id)
+                try:
+                    send_message(chat_id, "❌ You have been suspended; your tasks were stopped.")
+                except Exception:
+                    logger.exception("Failed to notify suspended user %s", user_id)
+                break
+
             task_id = task["id"]
             words = task["words"]
             total = task["total_words"]
@@ -525,6 +642,11 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                     if status == "cancelled":
                         break
                 if status == "cancelled":
+                    break
+                # Before each send check if user suspended now
+                if is_suspended(user_id):
+                    send_message(chat_id, "❌ You have been suspended; stopping your task.")
+                    cancel_active_task_for_user(user_id)
                     break
                 send_message(chat_id, words[i])
                 db_execute("UPDATE tasks SET sent_count = sent_count + 1 WHERE id = ?", (task_id,))
@@ -634,17 +756,22 @@ def webhook():
 
 # Command handlers
 def handle_command(user_id: int, username: str, command: str, args: str):
+    # allow /start and /help for anyone; otherwise check allowed (and suspended)
     if not is_allowed(user_id) and command not in ("/start", "/help"):
         send_message(user_id, "❌ Sorry, you are not allowed to use this bot. The owner has been notified.")
-        send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
+        # notify the primary owner (legacy behavior)
+        try:
+            send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
+        except Exception:
+            logger.exception("Failed to notify owner about unallowed access")
         return jsonify({"ok": True})
 
     if command == "/start":
         body = (
             f"👋 Hi {username or user_id}!\n"
             "I split your text into individual word messages.\n"
-            "Admin commands (admins + owner): /adduser /removeuser /listusers\n"
-            "Owner-only: /botinfo /broadcast /addadmin /removeadmin\n"
+            "Admin commands (admins + owner): /adduser /listusers /listsuspended\n"
+            "Owner-only: /botinfo /broadcast /suspend /unsuspend\n"
             "User commands: /start /example /pause /resume /status /stop /stats /about\n"
             "Just send any text and I'll split it for you."
         )
@@ -816,43 +943,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 
         return jsonify({"ok": True})
 
-    if command == "/removeuser":
-        if not is_admin(user_id):
-            send_message(user_id, "❌ You are not allowed to use this.")
-            return jsonify({"ok": True})
-        if not args:
-            send_message(user_id, "Usage: /removeuser <telegram_user_id>")
-            return jsonify({"ok": True})
-        try:
-            target_id = int(args.split()[0])
-        except Exception:
-            send_message(user_id, "Invalid user id.")
-            return jsonify({"ok": True})
-        # Cancel any active/queued/paused tasks for the target user so they stop permanently and cannot be resumed.
-        stopped_count = cancel_active_task_for_user(target_id)
-        # Ensure finished_at is set for cancelled tasks (best-effort)
-        try:
-            db_execute("UPDATE tasks SET finished_at = ? WHERE user_id = ? AND status = 'cancelled' AND (finished_at IS NULL OR finished_at = '')", (get_now_iso(), target_id))
-        except Exception:
-            logger.exception("Error updating finished_at for cancelled tasks of user %s", target_id)
-
-        # Remove target user regardless of their is_admin flag (admins or normal users)
-        db_execute("DELETE FROM allowed_users WHERE user_id = ?", (target_id,))
-        send_message(user_id, f"✅ User {target_id} removed.")
-
-        # Notify the removed user: they were removed and any active/queued tasks were permanently stopped and cannot be resumed.
-        try:
-            send_message(target_id, "❌ You have been removed. Contact the owner to regain access.")
-            if stopped_count > 0:
-                send_message(target_id, f"🛑 Your active/queued task(s) ({stopped_count}) were stopped permanently and cannot be resumed.")
-            else:
-                send_message(target_id, "ℹ️ You had no active or queued tasks to stop.")
-        except Exception:
-            # If we can't send messages to the user (e.g. blocked), still proceed.
-            logger.exception("Failed to notify removed user %s", target_id)
-
-        return jsonify({"ok": True})
-
     if command == "/listusers":
         if not is_admin(user_id):
             send_message(user_id, "❌ You are not allowed to use this.")
@@ -865,49 +955,86 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, body)
         return jsonify({"ok": True})
 
-    # owner-only addadmin/removeadmin
-    if command == "/addadmin":
-        if user_id != OWNER_ID:
-            send_message(user_id, "❌ Only the owner can add admins.")
+    # Owner-only: /suspend and /unsuspend
+    if command == "/suspend":
+        if user_id not in OWNERS:
+            send_message(user_id, "❌ Only the owner(s) can suspend users.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /addadmin <telegram_user_id>")
+            send_message(user_id, "Usage: /suspend <telegram_user_id> [duration]\nDuration examples: 1h, 30m, 3600 (seconds). Default: 1h")
             return jsonify({"ok": True})
+        parts = args.split(None, 1)
         try:
-            target_id = int(args.split()[0])
+            target_id = int(parts[0])
         except Exception:
             send_message(user_id, "Invalid user id.")
             return jsonify({"ok": True})
-        rows = db_execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (target_id,), fetch=True)
-        if not rows:
-            db_execute("INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
-                       (target_id, "", get_now_iso(), 1))
+        duration_seconds = None
+        if len(parts) > 1 and parts[1].strip():
+            duration_seconds = parse_duration_to_seconds(parts[1].strip())
+            if duration_seconds is None:
+                send_message(user_id, "Invalid duration. Use e.g. 1h, 30m, 3600 (seconds), 1d.")
+                return jsonify({"ok": True})
         else:
-            db_execute("UPDATE allowed_users SET is_admin = 1 WHERE user_id = ?", (target_id,))
-        send_message(user_id, f"✅ {target_id} is now an admin.")
-        send_message(target_id, "✅ You have been granted admin privileges.")
+            duration_seconds = 3600  # default 1 hour
+
+        until = datetime.utcnow() + timedelta(seconds=duration_seconds)
+        suspend_user_in_db(target_id, until.isoformat(), added_by=user_id, reason="")
+        send_message(user_id, f"✅ User {target_id} suspended until {until.isoformat()} UTC.")
+        try:
+            send_message(target_id, f"❌ You have been suspended until {until.isoformat()} UTC. Contact the owner for more info.")
+        except Exception:
+            logger.exception("Failed to notify suspended user %s", target_id)
         return jsonify({"ok": True})
 
-    if command == "/removeadmin":
-        if user_id != OWNER_ID:
-            send_message(user_id, "❌ Only the owner can remove admins.")
+    if command == "/unsuspend":
+        if user_id not in OWNERS:
+            send_message(user_id, "❌ Only the owner(s) can unsuspend users.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /removeadmin <telegram_user_id>")
+            send_message(user_id, "Usage: /unsuspend <telegram_user_id>")
             return jsonify({"ok": True})
         try:
             target_id = int(args.split()[0])
         except Exception:
             send_message(user_id, "Invalid user id.")
             return jsonify({"ok": True})
-        db_execute("UPDATE allowed_users SET is_admin = 0 WHERE user_id = ?", (target_id,))
-        send_message(user_id, f"✅ Admin removed: {target_id}")
-        send_message(target_id, "❌ Your admin privileges have been revoked.")
+        row = get_suspended_row(target_id)
+        if not row:
+            send_message(user_id, f"ℹ️ User {target_id} is not suspended.")
+            return jsonify({"ok": True})
+        unsuspend_user_in_db(target_id)
+        send_message(user_id, f"✅ User {target_id} unsuspended.")
+        try:
+            send_message(target_id, "✅ You have been unsuspended and can use the bot again.")
+        except Exception:
+            logger.exception("Failed to notify unsuspended user %s", target_id)
+        return jsonify({"ok": True})
+
+    # Admin + owner: list suspended users
+    if command == "/listsuspended":
+        if not is_admin(user_id):
+            send_message(user_id, "❌ You are not allowed to use this.")
+            return jsonify({"ok": True})
+        cleanup_expired_suspensions()
+        rows = db_execute("SELECT user_id, suspended_until, reason, added_by, added_at FROM suspended_users ORDER BY suspended_until ASC", fetch=True)
+        if not rows:
+            send_message(user_id, "No suspended users.")
+            return jsonify({"ok": True})
+        lines = []
+        for r in rows:
+            uid = r[0]
+            until = r[1] or ""
+            reason = r[2] or ""
+            added_by = r[3] or ""
+            added_at = r[4] or ""
+            lines.append(f"{uid} suspended_until={until} by={added_by} at={added_at} reason={reason}")
+        send_message(user_id, "Suspended users:\n" + "\n".join(lines))
         return jsonify({"ok": True})
 
     if command == "/botinfo":
-        if user_id != OWNER_ID:
-            send_message(user_id, "❌ Only the bot owner can use /botinfo")
+        if user_id not in OWNERS:
+            send_message(user_id, "❌ Only the bot owner(s) can use /botinfo")
             return jsonify({"ok": True})
         total_allowed = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
         active_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')", fetch=True)[0][0]
@@ -949,9 +1076,14 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             wsum = int(r[2] or 0)
             stats_lines.append(f"{uid}{(' (' + uname + ')') if uname else ''} - {wsum} words")
 
+        # Suspended count
+        cleanup_expired_suspensions()
+        suspended_count = db_execute("SELECT COUNT(*) FROM suspended_users", fetch=True)[0][0]
+
         body_parts = [
             "Bot status: Online",
             f"Allowed users: {total_allowed}",
+            f"Suspended users: {suspended_count}",
             f"Active tasks: {active_tasks}",
             f"Queued tasks: {queued_tasks}",
             "",
@@ -966,7 +1098,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True})
 
     if command == "/broadcast":
-        if user_id != OWNER_ID:
+        if user_id not in OWNERS:
             send_message(user_id, "❌ Only owner can broadcast")
             return jsonify({"ok": True})
         if not args:
@@ -996,11 +1128,17 @@ def get_queue_size(user_id):
 def handle_new_text(user_id: int, username: str, text: str):
     if not is_allowed(user_id):
         send_message(user_id, "❌ Sorry, you are not allowed. The owner has been notified.")
-        send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
+        try:
+            send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
+        except Exception:
+            logger.exception("Failed to notify owner about unallowed message")
         return jsonify({"ok": True})
     if is_maintenance_now():
         send_message(user_id, "🛠️ Maintenance in progress. New tasks are blocked. Please try later.")
-        send_message(OWNER_ID, f"🛠️ Maintenance attempt by {user_id}.")
+        try:
+            send_message(OWNER_ID, f"🛠️ Maintenance attempt by {user_id}.")
+        except Exception:
+            logger.exception("Failed to notify owner about maintenance attempt")
         return jsonify({"ok": True})
     res = enqueue_task(user_id, username, text)
     if not res["ok"]:
