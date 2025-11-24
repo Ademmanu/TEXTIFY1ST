@@ -1068,24 +1068,27 @@ def set_webhook():
     except Exception:
         logger.exception("set_webhook failed 🚨")
         
-@app.route("/mem", methods=["GET"])
+# Max container RAM for Free Tier
+CONTAINER_MAX_RAM_MB = 512
+
+@app.route("/mem")
 def mem_usage():
     process = psutil.Process()
     mem_used_mb = process.memory_info().rss / (1024 * 1024)
-    return f"Memory used by app: *{mem_used_mb:.2f}* MB 💾\n"
+    return f"Memory used by app: {mem_used_mb:.2f} MB\n"
 
-@app.route("/sysmem", methods=["GET"])
+@app.route("/sysmem")
 def system_memory():
-    vm = psutil.virtual_memory()
-    total = vm.total / (1024 * 1024)
-    available = vm.available / (1024 * 1024)
-    used = vm.used / (1024 * 1024)
-    percent = vm.percent
+    process = psutil.Process()
+    mem_used_mb = process.memory_info().rss / (1024 * 1024)
+    available_mb = max(CONTAINER_MAX_RAM_MB - mem_used_mb, 0)
+    percent = (mem_used_mb / CONTAINER_MAX_RAM_MB) * 100
+
     return (
-        f"Total system RAM: *{total:.2f}* MB 🧠\n"
-        f"Available RAM: *{available:.2f}* MB ✅\n"
-        f"Used RAM: *{used:.2f}* MB 🔴\n"
-        f"Usage percent: *{percent}%* 📊\n"
+        f"Total container RAM (Free Tier): {CONTAINER_MAX_RAM_MB:.2f} MB\n"
+        f"Available RAM: {available_mb:.2f} MB\n"
+        f"Used RAM: {mem_used_mb:.2f} MB\n"
+        f"Usage percent: {percent:.1f}%\n"
     )
 
 if __name__ == "__main__":
