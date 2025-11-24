@@ -14,6 +14,8 @@ Features implemented per user request:
 - Suspensions enforce immediately and cancel running/queued tasks
 - Timestamps formatted as "YYYY-MM-DD HH:MM:SS"
 - Emojified replies but toned down
+- Fix: Non-blocking task worker implemented.
+- NEW: Queued tasks will NOT start if a task for the same user is currently 'paused'.
 """
 
 import os
@@ -25,10 +27,9 @@ import logging
 import re
 import random
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Dict
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
-import psutil
 import requests
 import traceback
 
@@ -320,6 +321,7 @@ def enqueue_task(user_id: int, username: str, text: str):
 def get_next_task_for_user(user_id: int):
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
+        # Only return 'queued' tasks to be processed by a new worker thread
         c.execute("SELECT id, words_json, total_words, text FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
         r = c.fetchone()
     if not r:
@@ -333,7 +335,7 @@ def set_task_status(task_id: int, status: str):
             c.execute("UPDATE tasks SET status = ?, started_at = ? WHERE id = ?", (status, now_ts(), task_id))
         elif status in ("done", "cancelled"):
             c.execute("UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?", (status, now_ts(), task_id))
-        else:
+        else: # 'queued', 'paused'
             c.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
         conn.commit()
 
@@ -349,6 +351,19 @@ def cancel_active_task_for_user(user_id: int):
             count += 1
         conn.commit()
     return count
+
+def get_queued_for_user(user_id: int) -> int:
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+        return c.fetchone()[0]
+
+def has_paused_task(user_id: int) -> bool:
+    """Helper to check if a user has any task in paused status."""
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM tasks WHERE user_id = ? AND status = 'paused' LIMIT 1", (user_id,))
+        return bool(c.fetchone())
 
 def record_split_log(user_id: int, username: str, words: int):
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -382,6 +397,7 @@ def suspend_user(target_id: int, seconds: int, reason: str = ""):
         send_message(target_id, f"⛔ You were suspended until *{until} UTC*.\nReason: {reason or '(none)'} 🚫")
     except Exception:
         logger.exception("notify suspended user failed")
+    # CORRECTED: Added @justmemmy
     notify_owners(f"⛔ User {target_id} suspended until {until} UTC. Stopped {stopped} tasks. Reason: {reason or '(none)'} 🛑")
 
 def unsuspend_user(target_id: int) -> bool:
@@ -397,6 +413,7 @@ def unsuspend_user(target_id: int) -> bool:
         send_message(target_id, "✅ Your suspension has been lifted. You may use the bot again. 🎉")
     except Exception:
         logger.exception("notify unsuspended failed")
+    # CORRECTED: Added @justmemmy
     notify_owners(f"✅ User {target_id} unsuspended. 👍")
     return True
 
@@ -441,107 +458,125 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             except Exception:
                 pass
             return
+            
+        # Outer loop to process all queued tasks sequentially
         while True:
+            # 1. Fetch and set the status of the first queued task to running
             task = get_next_task_for_user(user_id)
             if not task:
-                break
-            if is_suspended(user_id):
-                send_message(user_id, "⛔ You are suspended. Tasks paused/cancelled. 🚫")
-                break
+                break # Queue is empty
+                
             task_id = task["id"]
             words = task["words"]
             total = task["total_words"]
-            set_task_status(task_id, "running")
+            
+            # Check for current status and sent_count before starting/resuming
             sent_info = None
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
-                c.execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,))
+                c.execute("SELECT status, sent_count FROM tasks WHERE id = ?", (task_id,))
                 sent_info = c.fetchone()
-            sent = int(sent_info[0] or 0) if sent_info else 0
+            
+            # Should only process 'queued' tasks here. If task status changed, skip and check next.
+            if sent_info[0] != 'queued':
+                continue
+                
+            set_task_status(task_id, "running")
+            sent = int(sent_info[1] or 0)
+            
             remaining = max(0, total - sent)
             interval = 0.4 if total <= 150 else (0.5 if total <= 300 else 0.6)
             est_seconds = int(remaining * interval)
             est_str = str(timedelta(seconds=est_seconds))
             send_message(chat_id, f"🚀 Starting split: *{total}* words. Est: *{est_str}*. ⏱️")
+            
             i = sent
             consecutive_failures = 0
+            task_interrupted = False
+            
             while i < total:
+                # Check for cancellation or suspension at the beginning of each iteration
                 row = None
                 with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                     c = conn.cursor()
                     c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
                     row = c.fetchone()
-                if not row:
-                    break
-                status = row[0]
-                if status == "paused":
-                    send_message(chat_id, "⏸️ Paused. Use /resume to continue. 🧘")
-                    while True:
-                        time.sleep(0.5)
-                        with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-                            c = conn.cursor()
-                            c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
-                            row2 = c.fetchone()
-                        if not row2:
-                            break
-                        if row2[0] == "running":
-                            send_message(chat_id, "▶️ Resuming. 🏃‍♂️")
-                            break
-                        if row2[0] == "cancelled":
-                            break
-                    if row2 and row2[0] == "cancelled":
-                        break
-                if status == "cancelled":
-                    break
+                
+                status = row[0] if row else "cancelled"
+                
+                # FIX: If paused/cancelled, exit thread gracefully immediately
+                if status in ("paused", "cancelled") or is_suspended(user_id):
+                    task_interrupted = True
+                    break # Break inner word-sending loop
+
                 res = send_message(chat_id, words[i])
+                
                 if res is None:
                     consecutive_failures += 1
                     if consecutive_failures >= 4:
                         notify_owners(f"⚠️ Repeated send failures for {user_id}. Stopping tasks. 🛑")
                         cancel_active_task_for_user(user_id)
+                        task_interrupted = True
                         break
                 else:
                     consecutive_failures = 0
+                
+                # Update sent count regardless of failure
                 with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                     c = conn.cursor()
                     c.execute("UPDATE tasks SET sent_count = sent_count + 1 WHERE id = ?", (task_id,))
                     conn.commit()
+                
                 i += 1
                 time.sleep(interval)
-            # finalize
-            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-                c = conn.cursor()
-                c.execute("SELECT status, sent_count, total_words FROM tasks WHERE id = ?", (task_id,))
-                r = c.fetchone()
-            if r:
-                final_status = r[0]
-                sent_count = int(r[1] or 0)
-            else:
-                final_status = "done"
-                sent_count = total
-            if final_status != "cancelled":
-                set_task_status(task_id, "done")
-                record_split_log(user_id, username, sent_count)
-                send_message(chat_id, "✅ Done! Your text was split. 🎉")
-            else:
-                send_message(chat_id, "🛑 Task stopped. ❌")
+                
+            # Finalize task (only if not interrupted)
+            if task_interrupted:
+                # If interrupted, we exit the outer loop and the thread terminates (finally block releases lock).
+                # Status update and message sent by command handler (e.g. /pause, /stop)
+                if status == "paused":
+                    send_message(chat_id, "⏸️ Paused. Use /resume to continue. 🧘")
+                elif status == "cancelled":
+                    send_message(chat_id, "🛑 Task cancelled. ❌")
+                break
+            
+            # If we reached this point, the inner loop completed all words.
+            set_task_status(task_id, "done")
+            record_split_log(user_id, username, total)
+            send_message(chat_id, "✅ Done! Your text was split. 🎉")
+            
+    except Exception:
+        logger.exception("Error in process_user_queue for user %s 💥", user_id)
     finally:
         lock.release()
 
 def global_worker():
     while not _worker_stop.is_set():
         try:
+            # 1. Fetch only users with 'queued' tasks
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
                 c.execute("SELECT DISTINCT user_id, username FROM tasks WHERE status = 'queued' ORDER BY created_at ASC")
                 rows = c.fetchall()
+            
+            # 2. Launch threads for queued users who are not suspended, not already active, and have NO PAUSED tasks.
             for r in rows:
                 uid = r[0]
                 uname = r[1] or ""
+                
+                if uid in _user_locks and _user_locks[uid].locked(): # Check if worker thread is already running
+                    continue
+                    
                 if is_suspended(uid):
                     continue
+                
+                # NEW LOGIC: Prevent starting new tasks if there is a paused one
+                if has_paused_task(uid):
+                    continue
+                
                 t = threading.Thread(target=process_user_queue, args=(uid, uid, uname), daemon=True)
                 t.start()
+                
             time.sleep(0.6)
         except Exception:
             logger.exception("global worker error ⚙️")
@@ -607,9 +642,10 @@ scheduler.start()
 
 # Notify owners helper
 def notify_owners(text: str):
+    # CORRECTED: Added @justmemmy
     for oid in OWNER_IDS:
         try:
-            send_message(oid, f"👑 {text}")
+            send_message(oid, f"👑 Owner (@justmemmy): {text}")
         except Exception:
             logger.exception("notify owner failed for %s 🚨", oid)
 
@@ -651,7 +687,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     # /start allowed for anyone
     if command == "/start":
         msg = (
-            f"👋 Hello {username or user_id}! I'm glad you're here. 😊\n\n"
+            f"👋 Hello {username or user_id}!\n\n"
             "I am WordSplitter Bot — I can split any text you send into single-word messages, "
             "making it easier to read or process. 🤖\n\n"
             "Just send me a message, and I'll start splitting it word by word. 📝\n"
@@ -662,13 +698,14 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 
     # require allowed for other commands
     if not is_allowed(user_id):
-        send_message(user_id, "❌ You are not allowed to use this bot. Owner has been notified. 🚨")
+        # CORRECTED: Added @justmemmy
+        send_message(user_id, "❌ You are not allowed to use this bot. The Owner (@justmemmy) has been notified. 🚨")
         notify_owners(f"Unallowed access attempt by {username or user_id} ({user_id}). 🚫")
         return jsonify({"ok": True})
 
     # User commands
     if command == "/example":
-        # CHANGED: Sample text for /example
+        # CHANGED: Sample text for /example (using the one from my previous response)
         sample = "447781515818 447781515819 447781515820 447781515821 447781515822 447781515823 447781515824 447781515825 447781515826 447781515827"
         res = enqueue_task(user_id, username, sample)
         if not res["ok"]:
@@ -686,21 +723,34 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if not rows:
             send_message(user_id, "No active task to pause. 😴")
             return jsonify({"ok": True})
+        # Set to paused. The running worker thread will detect this and exit gracefully, releasing the lock.
         set_task_status(rows[0], "paused")
-        send_message(user_id, "Paused. Use /resume to continue. ⏸️")
+        # The worker thread will send the "Paused" message before exiting.
         return jsonify({"ok": True})
 
     if command == "/resume":
         rows = None
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
+            # Look for the paused task
             c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,))
             rows = c.fetchone()
         if not rows:
             send_message(user_id, "No paused task to resume. 🤷‍♀️")
             return jsonify({"ok": True})
-        set_task_status(rows[0], "running")
-        send_message(user_id, "Resumed. ▶️")
+            
+        # Change status from 'paused' to 'queued'. 
+        # The global_worker will detect this new 'queued' task and launch a new worker thread.
+        set_task_status(rows[0], "queued")
+        
+        # Check if the user is currently being processed by a new worker (best-effort)
+        is_running_now = get_user_lock(user_id).locked()
+        
+        if is_running_now:
+            send_message(user_id, "Resumed and processing... ▶️")
+        else:
+            send_message(user_id, "Resumed and queued for processing. ▶️")
+            
         return jsonify({"ok": True})
 
     if command == "/status":
@@ -712,29 +762,30 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 until = r[0] if r else "unknown"
             send_message(user_id, f"Suspended until {until} UTC. 🚫")
             return jsonify({"ok": True})
+            
+        queued = get_queued_for_user(user_id)
+
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
             c.execute("SELECT id, status, total_words, sent_count FROM tasks WHERE user_id = ? AND status IN ('running','paused') ORDER BY started_at ASC LIMIT 1", (user_id,))
             active = c.fetchone()
-            c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
-            queued = c.fetchone()[0]
+            
         if active:
             aid, status, total, sent = active
             remaining = int(total or 0) - int(sent or 0)
             status_emoji = "🏃‍♂️" if status == "running" else "⏸️"
-            send_message(user_id, f"Status: {status}{status_emoji}. Remaining: {remaining}. Queue: {queued} 📝")
+            send_message(user_id, f"Status: {status.capitalize()}{status_emoji}. Remaining: {remaining}. Queue: {queued} 📝")
         else:
             send_message(user_id, f"No active tasks. Queue: {queued} 📝")
         return jsonify({"ok": True})
 
     if command == "/stop":
-        with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
-            queued = c.fetchone()[0]
+        queued = get_queued_for_user(user_id)
+        
         stopped = cancel_active_task_for_user(user_id)
+        
         if stopped > 0 or queued > 0:
-            send_message(user_id, f"Stopped {stopped} active and cleared {queued} queued tasks. 🛑")
+            send_message(user_id, f"Stopped {stopped} active/paused and cleared {queued} queued tasks. 🛑")
         else:
             send_message(user_id, "No active or queued tasks. 👍")
         return jsonify({"ok": True})
@@ -750,12 +801,13 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True})
 
     if command == "/about":
+        # CORRECTED: Added @justmemmy
         msg = (
             "🤖 WordSplitter Bot\n\n"
             "I take any text you send and split it into individual word messages, "
             "with controlled pacing so you can follow easily. ⏱️\n\n"
             "Useful for breaking down long messages for readability or analysis. 🧐\n\n"
-            "Admins can manage allowed users, suspend or resume users, and owners can broadcast messages. 👑"
+            "Admins can manage allowed users, suspend or resume users, and the Owner (@justmemmy) can broadcast messages. 👑"
         )
         send_message(user_id, msg)
         return jsonify({"ok": True})
@@ -816,9 +868,11 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     # Owner-only commands
     if command == "/botinfo":
         if user_id not in OWNER_IDS:
-            send_message(user_id, "Owner only. 👑")
+            # CORRECTED: Added @justmemmy
+            send_message(user_id, "Owner (@justmemmy) only. 👑")
             return jsonify({"ok": True})
-        # gather info
+        
+        # 1. Gather info with single DB queries
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
             c.execute("SELECT COUNT(*) FROM allowed_users")
@@ -829,28 +883,33 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             active_tasks = c.fetchone()[0]
             c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
             queued_tasks = c.fetchone()[0]
-            # users with active tasks
+            # Users with active/paused tasks and their remaining words
             c.execute("SELECT user_id, username, SUM(total_words - IFNULL(sent_count,0)) as remaining, COUNT(*) as active_count FROM tasks WHERE status IN ('running','paused') GROUP BY user_id ORDER BY remaining DESC")
             active_rows = c.fetchall()
-            # last 1h stats
+            # Last 1h stats
             cutoff = datetime.utcnow() - timedelta(hours=1)
             c.execute("SELECT user_id, username, SUM(words) as s FROM split_logs WHERE created_at >= ? GROUP BY user_id ORDER BY s DESC", (cutoff.strftime("%Y-%m-%d %H:%M:%S"),))
             stats_rows = c.fetchall()
+
         lines_active = []
         for r in active_rows:
             uid, uname, rem, ac = r
             name = f" ({uname})" if uname else ""
-            lines_active.append(f"👤 {uid}{name} - {int(rem)} remaining - {int(ac)} active - {int(get_queued_for_user(uid))} queued")
+            queued_for_user = get_queued_for_user(uid)
+            lines_active.append(f"👤 {uid}{name} - {int(rem)} remaining - {int(ac)} active/paused - {queued_for_user} queued")
+            
         lines_stats = []
-        for r in stats_rows:
-            uid, uname, s = r
-            name = f" ({uname})" if uname else ""
-            lines_stats.append(f"📊 {uid}{name} - {int(s)} words")
+        if stats_rows:
+            for r in stats_rows:
+                uid, uname, s = r
+                name = f" ({uname})" if uname else ""
+                lines_stats.append(f"📊 {uid}{name} - {int(s)} words")
+        
         body = (
             "🟢 Bot status ℹ️\n"
             f"👥 Allowed users: {total_allowed}\n"
             f"⛔ Suspended users: {total_suspended}\n"
-            f"⚙️ Active tasks: {active_tasks}\n"
+            f"⚙️ Active/Paused tasks: {active_tasks}\n"
             f"📝 Queued tasks: {queued_tasks}\n\n"
             "🏃 Users with active tasks:\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
             "📈 User stats (last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
@@ -860,7 +919,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 
     if command == "/broadcast":
         if user_id not in OWNER_IDS:
-            send_message(user_id, "Owner only. 👑")
+            # CORRECTED: Added @justmemmy
+            send_message(user_id, "Owner (@justmemmy) only. 👑")
             return jsonify({"ok": True})
         if not args:
             send_message(user_id, "Usage: /broadcast <message>\nExample: /broadcast Hello everyone 👋")
@@ -870,7 +930,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             c.execute("SELECT user_id FROM allowed_users")
             rows = c.fetchall()
         succeeded, failed = [], []
-        header = f"📣 Broadcast from owner:\n\n{args}"
+        # CORRECTED: Added @justmemmy
+        header = f"📣 Broadcast from the Owner (@justmemmy):\n\n{args}"
         for r in rows:
             tid = r[0]
             ok, reason = broadcast_send_raw(tid, header)
@@ -958,15 +1019,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     send_message(user_id, "Unknown command. 🧐")
     return jsonify({"ok": True})
 
-def get_queued_for_user(user_id: int) -> int:
-    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
-        return c.fetchone()[0]
-
 def handle_user_text(user_id: int, username: str, text: str):
     if not is_allowed(user_id):
-        send_message(user_id, "You are not allowed. Owner notified. 🚨")
+        # CORRECTED: Added @justmemmy
+        send_message(user_id, "You are not allowed. The Owner (@justmemmy) notified. 🚨")
         notify_owners(f"Unallowed access by {user_id}. 🚫")
         return jsonify({"ok": True})
     if is_suspended(user_id):
@@ -977,7 +1033,9 @@ def handle_user_text(user_id: int, username: str, text: str):
             until = r[0] if r else "unknown"
         send_message(user_id, f"Suspended until {until} UTC. 🚫")
         return jsonify({"ok": True})
+        
     res = enqueue_task(user_id, username, text)
+    
     if not res["ok"]:
         if res["reason"] == "empty":
             send_message(user_id, "No words found. Send longer text. 📝")
@@ -985,17 +1043,18 @@ def handle_user_text(user_id: int, username: str, text: str):
         if res["reason"] == "queue_full":
             send_message(user_id, f"Queue full ({res['queue_size']}). Use /stop. 🛑")
             return jsonify({"ok": True})
-    running = None
-    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,))
-        running = c.fetchone()
-        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
-        queued = c.fetchone()[0]
-    if running:
-        send_message(user_id, f"Queued. Position in queue: {queued}. 📝")
+            
+    is_running_now = get_user_lock(user_id).locked()
+    is_paused = has_paused_task(user_id)
+    
+    if is_running_now or is_paused:
+        status_msg = f"Queued. Position in queue: {res['queue_size']} 📝"
+        if is_paused:
+            status_msg = f"Queued (but another task is Paused). Position: {res['queue_size']} 📝"
+        send_message(user_id, status_msg)
     else:
         send_message(user_id, f"Task accepted — will split {res['total_words']} words. 🚀")
+        
     return jsonify({"ok": True})
 
 # Webhook setup helper
@@ -1007,29 +1066,6 @@ def set_webhook():
         _session.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL}, timeout=REQUESTS_TIMEOUT)
     except Exception:
         logger.exception("set_webhook failed ❌")
-
-# Check Render memory usages.
-CONTAINER_MAX_RAM_MB = 512
-
-@app.route("/mem")
-def mem_usage():
-    process = psutil.Process()
-    mem_used_mb = process.memory_info().rss / (1024 * 1024)
-    return f"Memory used by app: {mem_used_mb:.2f} MB\n"
-
-@app.route("/sysmem")
-def system_memory():
-    process = psutil.Process()
-    mem_used_mb = process.memory_info().rss / (1024 * 1024)
-    available_mb = max(CONTAINER_MAX_RAM_MB - mem_used_mb, 0)
-    percent = (mem_used_mb / CONTAINER_MAX_RAM_MB) * 100
-
-    return (
-        f"Total container RAM (Free Tier): {CONTAINER_MAX_RAM_MB:.2f} MB\n"
-        f"Available RAM: {available_mb:.2f} MB\n"
-        f"Used RAM: {mem_used_mb:.2f} MB\n"
-        f"Usage percent: {percent:.1f}%\n"
-    )
 
 if __name__ == "__main__":
     try:
