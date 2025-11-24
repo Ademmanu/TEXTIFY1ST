@@ -7,20 +7,21 @@ Features implemented per user request:
 - /adduser, /listusers (admin)
 - /suspend, /unsuspend, /listsuspended (admin) with usage examples when input is invalid
 - Broadcast uses one-shot sender (no retries) to avoid duplicate deliveries
-- Hourly owner stats (last 1 hour) sent automatically and included in /botinfo
+- Hourly owner stats (last 1 hour) sent automatically and included in /botinfo, without "UTC time" reference.
 - /help removed completely
 - Bot-health hourly reports removed
 - Suspensions enforce immediately and cancel running/queued tasks
 - Timestamps formatted as "YYYY-MM-DD HH:MM:SS" (in UTC for database)
-- Time displays converted to WAT (Nigeria Time) for user-facing messages (no "UTC time" mention)
+- Time displays converted to WAT (Nigeria Time) for user-facing messages
 - Added Scheduled Maintenance (3:00 AM - 4:00 AM WAT)
 - Added /mem and /sysmem endpoints for memory usage checking (psutil)
 - Fixed database inefficiency by reverting to per-word updates to satisfy /status requirement.
 - Maintenance now stops/cancels running tasks, not pauses them.
 - Fixed redundant maintenance notifications for suspended users.
 - Owner tag (@justmemmy) and emojis are consistently applied.
-- Emojis and friendly tone added throughout the script.
-- Optimized /botinfo database queries for efficiency.
+- Removed "UTC time" references from status/reports.
+- Simplified /stats output to remove the explicit 12-hour timestamp detail.
+- Fixed /botinfo inefficiency by getting all queued task counts in one query.
 """
 
 import os
@@ -32,7 +33,7 @@ import logging
 import re
 import random
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Dict
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
 import requests
@@ -118,7 +119,7 @@ def utc_to_wat_ts(utc_ts: str) -> str:
         return wat_dt.strftime("%Y-%m-%d %H:%M:%S WAT")
     except Exception:
         # Fallback if DB data is corrupted
-        return f"{utc_ts} (time error 🕰️)"
+        return f"{utc_ts} (UTC error)"
 
 # Maintenance State
 _is_maintenance = False
@@ -228,7 +229,7 @@ for uid in parse_id_list(ALLOWED_USERS_RAW):
             # best-effort notify
             try:
                 if TELEGRAM_API:
-                    _session.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": uid, "text": "🎉 Great news! You've been added to the WordSplitter community! Send me some text to start splitting! 🚀"}, timeout=3)
+                    _session.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": uid, "text": "You were added via ALLOWED_USERS. Hello! 🥳"}, timeout=3)
             except Exception:
                 pass
     except Exception:
@@ -309,7 +310,7 @@ def increment_failure(user_id: int):
                           (failures, now_ts(), user_id))
             conn.commit()
         if failures >= 6:
-            notify_owners(f"🚨 **High Send Failure Alert!** 😢\n\nWe are repeatedly failing to send messages to user `{user_id}` (Count: {failures}). For the bot's health, we're stopping their tasks now. 🛑")
+            notify_owners(f"⚠️ Repeated send failures for {user_id} ({failures}). Stopping their tasks. 🛑")
             cancel_active_task_for_user(user_id)
     except Exception:
         logger.exception("increment_failure error")
@@ -358,7 +359,9 @@ def broadcast_to_all_allowed(text: str):
         rows = c.fetchall()
     for r in rows:
         tid = r[0]
-        broadcast_send_raw(tid, text) # Use broadcast_send_raw (one-shot, no retry/failure tracking)
+        # Check suspension to avoid duplicate maintenance notification
+        if not is_suspended(tid):
+            broadcast_send_raw(tid, text) # Use broadcast_send_raw (one-shot, no retry/failure tracking)
 
 def cancel_all_tasks():
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -374,7 +377,7 @@ def start_maintenance():
     with _maintenance_lock:
         _is_maintenance = True
     stopped = cancel_all_tasks()
-    msg = f"🚧 **Scheduled Maintenance Alert!** 🛠️\n\nWe're undergoing scheduled maintenance from *3:00 AM to 4:00 AM WAT*. The bot will be unavailable during this time.\n\nWe had to *stop* {stopped} pending tasks to ensure a smooth update. Please come back after 4:00 AM WAT! Thank you for your amazing patience! 🥰"
+    msg = f"⚠️ Maintenance Started! 🛠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tasks. Please try again after 4:00 AM WAT. Thank you for your patience! 🙏"
     broadcast_to_all_allowed(msg)
     logger.info("Maintenance started. All tasks cancelled.")
 
@@ -382,7 +385,7 @@ def end_maintenance():
     global _is_maintenance
     with _maintenance_lock:
         _is_maintenance = False
-    msg = "🎉 **Maintenance Complete!** 🥳\n\nThe WordSplitter bot is now back online and ready to split your words faster and better than ever! Let's go! 🚀"
+    msg = "✅ Maintenance Complete! 🥳\n\nThe WordSplitter bot is back online and ready to split your words. Thank you for your patience! 🎉"
     broadcast_to_all_allowed(msg)
     logger.info("Maintenance ended.")
 
@@ -471,8 +474,7 @@ def suspend_user(target_id: int, seconds: int, reason: str = ""):
         conn.commit()
     stopped = cancel_active_task_for_user(target_id)
     try:
-        send_message(target_id, 
-                     f"🛑 **Suspension Notice!** 😞\n\nYour access is restricted until *{until_wat_str}*.\nReason: {reason or '(none)'}\n\nPlease reach out to the owner (@justmemmy) if you have questions. 🙏")
+        send_message(target_id, f"⛔ You were suspended until *{until_wat_str}*.\nReason: {reason or '(none)'} 😔")
     except Exception:
         logger.exception("notify suspended user failed")
     notify_owners(f"⛔ User {target_id} suspended until {until_wat_str}. Stopped {stopped} tasks. Reason: {reason or '(none)'} 🛑")
@@ -487,7 +489,7 @@ def unsuspend_user(target_id: int) -> bool:
         c.execute("DELETE FROM suspended_users WHERE user_id = ?", (target_id,))
         conn.commit()
     try:
-        send_message(target_id, "🔓 **Suspension Lifted!** 🎉\n\nYour access has been restored! Feel free to start splitting words again! 🥳")
+        send_message(target_id, "✅ Your suspension has been lifted. You may use the bot again. 🙂")
     except Exception:
         logger.exception("notify unsuspended failed")
     notify_owners(f"✅ User {target_id} unsuspended. 🎉")
@@ -513,7 +515,7 @@ def is_suspended(user_id: int) -> bool:
             return False
 
 # Worker to process user queues
-_user_locks = {}
+_user_locks: Dict[int, threading.Lock] = {}
 _user_locks_lock = threading.Lock()
 _worker_stop = threading.Event()
 
@@ -530,8 +532,10 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
     try:
         # Check suspension/maintenance immediately upon starting task thread
         if is_suspended(user_id):
-            # Only notify if the task was running and is being forcibly stopped by suspension status change
-            send_message(user_id, "🚫 Task immediately cancelled because your account was suspended. Sorry! 😢")
+            try:
+                send_message(user_id, "⛔ You are suspended — tasks won't run until suspension ends. 😔")
+            except Exception:
+                pass
             return
         
         if is_maintenance_time():
@@ -549,7 +553,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                 
             # Re-check just in case suspension/maintenance was activated between task pull and lock acquire
             if is_suspended(user_id):
-                send_message(user_id, "🚫 Task immediately cancelled because your account was suspended. Sorry! 😢")
+                send_message(user_id, "⛔ You are suspended. Tasks paused/cancelled. 🛑")
                 set_task_status(task["id"], "cancelled") 
                 break
             
@@ -574,7 +578,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             interval = 0.4 if total <= 150 else (0.5 if total <= 300 else 0.6)
             est_seconds = int(remaining * interval)
             est_str = str(timedelta(seconds=est_seconds))
-            send_message(chat_id, f"▶️ Starting your word split! We have *{total}* words to go. Estimated time: *{est_str}*. Ready... set... go! 🏁")
+            send_message(chat_id, f"🚀 Starting split: *{total}* words. Est: *{est_str}*.")
             
             i = sent
             consecutive_failures = 0
@@ -597,7 +601,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                 
                 if is_suspended(user_id):
                     # Only notify if the task was running and is being forcibly stopped by suspension status change
-                    send_message(chat_id, "🚫 Task immediately cancelled because your account was suspended. Sorry! 😢")
+                    send_message(chat_id, "⛔ Your task was stopped because your account was suspended. 🛑")
                     set_task_status(task_id, "cancelled")
                     break
                 
@@ -610,7 +614,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
 
                 # Pause handling (allows external /resume)
                 if status == "paused":
-                    send_message(chat_id, "⏸️ Paused. Task is on hold! Use /resume to jump back in. ☕")
+                    send_message(chat_id, "⏸️ Paused. Use /resume to continue.")
                     
                     # Wait loop
                     while True:
@@ -627,7 +631,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                         if new_status == "cancelled" or is_suspended(user_id) or is_maintenance_time():
                             if is_suspended(user_id):
                                 set_task_status(task_id, "cancelled")
-                                send_message(chat_id, "🚫 Task immediately cancelled because your account was suspended. Sorry! 😢")
+                                send_message(chat_id, "⛔ Task stopped because your account was suspended. 🛑")
                             elif is_maintenance_time():
                                 set_task_status(task_id, "cancelled")
                                 # Only notify if not suspended
@@ -636,7 +640,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                             break # Break inner wait loop and send loop
 
                         if new_status == "running":
-                            send_message(chat_id, "▶️ Resuming! Let's finish this! 💨")
+                            send_message(chat_id, "▶️ Resuming.")
                             break
 
                     if new_status in ("cancelled", "paused"): # If it's still paused or terminated, break
@@ -676,9 +680,9 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             if final_status not in ("cancelled", "paused"): # If not manually stopped or paused, it's done.
                 set_task_status(task_id, "done")
                 record_split_log(user_id, username, i) # Record total words sent (i)
-                send_message(chat_id, "💯 **Finished!** All your words have been split! Amazing work! ✨")
+                send_message(chat_id, "✅ Done! Your text was split. ✨")
             elif final_status == "cancelled":
-                send_message(chat_id, "❌ **Task Stopped!** You can always send new text to start a new split. 📝")
+                send_message(chat_id, "🛑 Task stopped.")
             elif final_status == "paused":
                 # Do nothing, message was already sent
                 pass
@@ -727,6 +731,7 @@ def compute_last_hour_stats():
 def send_hourly_owner_stats():
     rows = compute_last_hour_stats()
     if not rows:
+        # Removed "(based on UTC time)"
         msg = "⏰ Hourly Report: no splits in the last hour. 😴"
         for oid in OWNER_IDS:
             try:
@@ -741,7 +746,8 @@ def send_hourly_owner_stats():
         w = int(r[2] or 0)
         part = f"{uid} ({uname}) - {w} words" if uname else f"{uid} - {w} words"
         lines.append(part)
-    body = "⏰ Hourly Report — last 1h:\n" + "\n".join(lines)
+    # Removed "(based on UTC time)"
+    body = "⏰ Hourly Report (Last 1h): 📝\n" + "\n".join(lines)
     for oid in OWNER_IDS:
         try:
             send_message(oid, body)
@@ -812,17 +818,23 @@ def root():
 def health():
     return jsonify({"ok": True, "ts": now_ts()}), 200
 
-# Command handlers
+# Helper function
+def get_queued_for_user(user_id: int) -> int:
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+        return c.fetchone()[0]
+
 def handle_command(user_id: int, username: str, command: str, args: str):
     # /start allowed for anyone
     if command == "/start":
         msg = (
-            "✨ **Welcome, {username or user_id}!** 🤖\n\n"
-            "I'm your friendly WordSplitter Bot! I take any text you send and break it down into single-word messages, "
-            "making huge blocks of text super easy to read! 📖\n\n"
-            "Simply send me your text to start the magic! 🪄\n"
-            "*Pro Tip:* Try /example for a quick demo! 🚀"
-        ).format(username=username, user_id=user_id)
+            f"👋 Hello {username or user_id}! 🤖\n\n"
+            "I am WordSplitter Bot — I can split any text you send into single-word messages, "
+            "making it easier to read or process. ✨\n\n"
+            "Just send me a message, and I'll start splitting it word by word. 🚀\n"
+            "You can also try /example to see a demo. 💡"
+        )
         send_message(user_id, msg)
         return jsonify({"ok": True})
         
@@ -852,7 +864,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if not res["ok"]:
             send_message(user_id, "😔 Could not queue demo. Try later.")
             return jsonify({"ok": True})
-        send_message(user_id, f"🌟 Demo queued! I'm getting ready to split *{res['total_words']}* words for you! Hang tight! 📝")
+        send_message(user_id, f"Demo queued — will split *{res['total_words']}* words. ✨")
         return jsonify({"ok": True})
 
     if command == "/pause":
@@ -862,10 +874,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,))
             rows = c.fetchone()
         if not rows:
-            send_message(user_id, "😌 Nothing running to pause right now! Maybe start a task first? 🤔")
+            send_message(user_id, "⏸️ No active task to pause.")
             return jsonify({"ok": True})
         set_task_status(rows[0], "paused")
-        send_message(user_id, "⏸️ Task paused successfully! Take a breather! Use /resume to jump back in. ▶️")
+        send_message(user_id, "⏸️ Paused. Use /resume to continue.")
         return jsonify({"ok": True})
 
     if command == "/resume":
@@ -875,10 +887,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             c.execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,))
             rows = c.fetchone()
         if not rows:
-            send_message(user_id, "😅 No tasks are currently paused. Nothing to resume! 🤷‍♀️")
+            send_message(user_id, "▶️ No paused task to resume.")
             return jsonify({"ok": True})
         set_task_status(rows[0], "running")
-        send_message(user_id, "▶️ Resumed! Back to work! 🏃‍♂️")
+        send_message(user_id, "▶️ Resumed.")
         return jsonify({"ok": True})
 
     if command == "/status":
@@ -889,7 +901,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 r = c.fetchone()
                 until_utc = r[0] if r else "unknown"
                 until_wat = utc_to_wat_ts(until_utc)
-            send_message(user_id, f"🚫 Oh no! You're suspended until *{until_wat}*. Please wait patiently! 🙏")
+            send_message(user_id, f"⛔ Suspended until *{until_wat}*.")
             return jsonify({"ok": True})
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
@@ -900,9 +912,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if active:
             aid, status, total, sent = active
             remaining = int(total or 0) - int(sent or 0)
-            send_message(user_id, f"🔎 **Current Task Status:** {status.capitalize()}. We have *{remaining}* words left to go! 🏃‍♀️\n📝 Tasks waiting in line: *{queued}*.")
+            # This remaining count is now immediate (Fix #1)
+            send_message(user_id, f"⚙️ Status: {status.capitalize()}. Remaining: *{remaining}* words. 📝 Queue: {queued}")
         else:
-            send_message(user_id, f"🧘‍♀️ All clear! No tasks running right now. You have *{queued}* tasks waiting in the queue.")
+            send_message(user_id, f"✅ No active tasks. 📝 Queue: {queued}")
         return jsonify({"ok": True})
 
     if command == "/stop":
@@ -912,28 +925,30 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             queued = c.fetchone()[0]
         stopped = cancel_active_task_for_user(user_id)
         if stopped > 0 or queued > 0:
-            send_message(user_id, f"✋ Mission aborted! We stopped *{stopped}* active tasks and cleared *{queued}* queued tasks for you! ✨")
+            send_message(user_id, f"🛑 Stopped {stopped} active and cleared {queued} queued tasks.")
         else:
-            send_message(user_id, "🤔 Couldn't find any tasks to stop! All clear! 🧹")
+            send_message(user_id, "No active or queued tasks.")
         return jsonify({"ok": True})
 
     if command == "/stats":
         cutoff_utc = datetime.utcnow() - timedelta(hours=12)
+        # Removed cutoff_wat variable and reference from message
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
             c.execute("SELECT SUM(words) FROM split_logs WHERE user_id = ? AND created_at >= ?", (user_id, cutoff_utc.strftime("%Y-%m-%d %H:%M:%S")))
             r = c.fetchone()
             words = int(r[0] or 0) if r else 0
-        send_message(user_id, f"📈 **Your Personal Stats (Last 12 hours):** You've split an incredible *{words}* words! Way to go! 🥳")
+        # Simplified message as requested
+        send_message(user_id, f"📊 Last 12 hours: *{words}* words split. 🚀")
         return jsonify({"ok": True})
 
     if command == "/about":
         msg = (
-            "🤖 **About WordSplitter Bot**\n\n"
-            "My core mission is to take your long, daunting texts and deliver them word-by-word with careful pacing. "
-            "It's the perfect way to make sure every word counts! 💖\n\n"
-            "Admins keep things running smoothly by managing access and suspensions. Our owner (@justmemmy) "
-            "uses their crown 👑 to send important broadcasts! Enjoy! 😊"
+            "🤖 WordSplitter Bot\n\n"
+            "I take any text you send and split it into individual word messages, "
+            "with controlled pacing so you can follow easily. ✨\n\n"
+            "Useful for breaking down long messages for readability or analysis. 💡\n\n"
+            "Admins can manage allowed users, suspend or resume users, and owners (@justmemmy) can broadcast messages. 👑"
         )
         send_message(user_id, msg)
         return jsonify({"ok": True})
@@ -941,10 +956,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     # Admin commands
     if command == "/adduser":
         if not is_admin(user_id):
-            send_message(user_id, "❌ Admin only. That command is for VIPs! 🚫")
+            send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "ℹ️ Usage: /adduser <id>\nExample: /adduser 12345678\n*You can add multiple IDs separated by spaces!*")
+            send_message(user_id, "ℹ️ Usage: /adduser <id> [username]\nExample: /adduser 12345678")
             return jsonify({"ok": True})
         parts = re.split(r"[,\s]+", args.strip())
         added, already, invalid = [], [], []
@@ -966,19 +981,19 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 conn.commit()
             added.append(tid)
             try:
-                send_message(tid, "🎉 Great news! You've been added to the WordSplitter community! Send me some text to start splitting! 🚀")
+                send_message(tid, "You were added. Send text to start. ✨")
             except Exception:
                 pass
         parts_msgs = []
-        if added: parts_msgs.append("✅ Successfully added: " + ", ".join(str(x) for x in added))
+        if added: parts_msgs.append("✅ Added: " + ", ".join(str(x) for x in added))
         if already: parts_msgs.append("ℹ️ Already allowed: " + ", ".join(str(x) for x in already))
-        if invalid: parts_msgs.append("❌ Invalid input (not an ID): " + ", ".join(invalid))
-        send_message(user_id, "Admin Command Result:\n" + ("\n".join(parts_msgs) if parts_msgs else "No changes"))
+        if invalid: parts_msgs.append("❌ Invalid: " + ", ".join(invalid))
+        send_message(user_id, "Result: " + ("; ".join(parts_msgs) if parts_msgs else "No changes"))
         return jsonify({"ok": True})
 
     if command == "/listusers":
         if not is_admin(user_id):
-            send_message(user_id, "❌ Admin only. That command is for VIPs! 🚫")
+            send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
@@ -988,14 +1003,14 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         for r in rows:
             uid, uname, isadm, added_at_utc = r
             added_at_wat = utc_to_wat_ts(added_at_utc)
-            lines.append(f"{'👑' if isadm else '👤'} {uid} ({uname or 'no-name'}) - {'Admin' if isadm else 'User'} - Since: {added_at_wat}")
-        send_message(user_id, "👥 **Allowed Users List:**\n" + ("\n".join(lines) if lines else "(none)"))
+            lines.append(f"👥 {uid} ({uname or 'no-name'}) - {'👑 Admin' if isadm else '👤 User'} - added={added_at_wat}")
+        send_message(user_id, "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)"))
         return jsonify({"ok": True})
 
     # Owner-only commands
     if command == "/botinfo":
         if user_id not in OWNER_IDS:
-            send_message(user_id, "👑 Owner only access. Sorry! 🥺")
+            send_message(user_id, "👑 Owner only.")
             return jsonify({"ok": True})
         # gather info
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -1004,70 +1019,58 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             total_allowed = c.fetchone()[0]
             c.execute("SELECT COUNT(*) FROM suspended_users")
             total_suspended = c.fetchone()[0]
-            c.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')")
-            active_tasks = c.fetchone()[0]
-            c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
-            queued_tasks = c.fetchone()[0]
-            
-            # users with active tasks
             c.execute("SELECT user_id, username, SUM(total_words - IFNULL(sent_count,0)) as remaining, COUNT(*) as active_count FROM tasks WHERE status IN ('running','paused') GROUP BY user_id ORDER BY remaining DESC")
             active_rows = c.fetchall()
-            active_uids = [r[0] for r in active_rows] # Get IDs of active users
-
-            # Fetch queued counts for those active users in one go (Optimization Fix)
-            queued_counts = {}
-            if active_uids:
-                placeholders = ','.join('?' for _ in active_uids)
-                c.execute(f"SELECT user_id, COUNT(*) FROM tasks WHERE status = 'queued' AND user_id IN ({placeholders}) GROUP BY user_id", active_uids)
-                for uid, count in c.fetchall():
-                    queued_counts[uid] = count
-            
+            c.execute("SELECT user_id, COUNT(*) FROM tasks WHERE status = 'queued' GROUP BY user_id")
+            queued_counts = {row[0]: row[1] for row in c.fetchall()} # Get all queued counts once (Fix: inefficiency)
+            c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
+            queued_tasks = c.fetchone()[0]
             # last 1h stats
             cutoff = datetime.utcnow() - timedelta(hours=1)
             c.execute("SELECT user_id, username, SUM(words) as s FROM split_logs WHERE created_at >= ? GROUP BY user_id ORDER BY s DESC", (cutoff.strftime("%Y-%m-%d %H:%M:%S"),))
             stats_rows = c.fetchall()
-
         lines_active = []
         for r in active_rows:
             uid, uname, rem, ac = r
             name = f" ({uname})" if uname else ""
-            user_queued = queued_counts.get(uid, 0)
-            lines_active.append(f"⚙️ {uid}{name} - {int(rem)} remaining - {int(ac)} active - {user_queued} queued")
-
+            # Use the pre-fetched queued count map
+            queued_for_user = queued_counts.get(uid, 0)
+            lines_active.append(f"⚙️ {uid}{name} - {int(rem)} remaining - {int(ac)} active - {queued_for_user} queued")
         lines_stats = []
         for r in stats_rows:
             uid, uname, s = r
             name = f" ({uname})" if uname else ""
             lines_stats.append(f"📈 {uid}{name} - {int(s)} words")
         
-        maintenance_status = "ON 🚧 (Busy updating!)" if is_maintenance_time() else "OFF ✅ (Ready to rock!)"
+        maintenance_status = "ON 🚧" if is_maintenance_time() else "OFF ✅"
         
         body = (
-            "🟢 **Bot System Health & Info** 🩺\n"
+            "🟢 Bot Status\n"
             f"🛠️ Maintenance Mode: {maintenance_status} (3:00 AM - 4:00 AM WAT)\n"
             f"👥 Allowed users: {total_allowed}\n"
             f"⛔ Suspended users: {total_suspended}\n"
-            f"⚙️ Active tasks: {active_tasks}\n"
+            f"⚙️ Active tasks: {len(active_rows)}\n" # Use len(active_rows) or total active count from separate query if needed
             f"📝 Queued tasks: {queued_tasks}\n\n"
-            "👤 Users with *Running* tasks:\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
-            "📊 User stats (last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
+            "👤 Users with active tasks:\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
+            # Removed "UTC time"
+            "📊 User Stats (Last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
         )
         send_message(user_id, body)
         return jsonify({"ok": True})
 
     if command == "/broadcast":
         if user_id not in OWNER_IDS:
-            send_message(user_id, "👑 Owner only access. Sorry! 🥺")
+            send_message(user_id, "👑 Owner only.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "ℹ️ Usage: /broadcast <message>\nExample: /broadcast Hello everyone, exciting updates soon! 🎉")
+            send_message(user_id, "ℹ️ Usage: /broadcast <message>\nExample: /broadcast Hello everyone")
             return jsonify({"ok": True})
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
             c.execute("SELECT user_id FROM allowed_users")
             rows = c.fetchall()
         succeeded, failed = [], []
-        header = f"📢 **Official Broadcast from Owner (@justmemmy):**\n\n{args}\n\n*Please read carefully!* 🧐"
+        header = f"📣 Broadcast from owner (@justmemmy):\n\n{args}"
         for r in rows:
             tid = r[0]
             ok, reason = broadcast_send_raw(tid, header)
@@ -1084,20 +1087,20 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     # Suspend / Unsuspend / Listsuspended
     if command == "/suspend":
         if not is_admin(user_id):
-            send_message(user_id, "❌ Admin only. That command is for VIPs! 🚫")
+            send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
         if not args:
             send_message(user_id,
                          "ℹ️ Usage: /suspend <user_id> <duration> [reason]\n"
                          "Examples:\n"
-                         "/suspend 12345678 30s Too much traffic\n"
-                         "/suspend 9876543 5m Policy violation")
+                         "/suspend 12345678 30s Spam\n"
+                         "/suspend 9876543 5m Too many messages")
             return jsonify({"ok": True})
         parts = args.split(None, 2)
         try:
             target = int(parts[0])
         except Exception:
-            send_message(user_id, "❌ Invalid user id. Must be a number!\nExample: /suspend 12345678 5m Spamming")
+            send_message(user_id, "❌ Invalid user id.\nExample: /suspend 12345678 5m Spamming")
             return jsonify({"ok": True})
         if len(parts) < 2:
             send_message(user_id, "❌ Missing duration.\nExample: /suspend 12345678 5m Spamming")
@@ -1106,18 +1109,18 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         reason = parts[2] if len(parts) > 2 else ""
         m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
         if not m:
-            send_message(user_id, "❌ Invalid duration format.\nUse: 30s (seconds), 5m (minutes), 3h (hours), 2d (days).\nExample: /suspend 12345678 5m")
+            send_message(user_id, "❌ Invalid duration format.\nUse 30s, 5m, 3h, 2d.\nExample: /suspend 12345678 5m")
             return jsonify({"ok": True})
         val, unit = int(m.group(1)), (m.group(2) or "s")
         mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
         seconds = val * mul
         suspend_user(target, seconds, reason)
-        send_message(user_id, f"✅ Successfully suspended {target} for {val}{unit}. All their tasks were cancelled. ⛔")
+        send_message(user_id, f"✅ Suspended {target} for {val}{unit}.")
         return jsonify({"ok": True})
 
     if command == "/unsuspend":
         if not is_admin(user_id):
-            send_message(user_id, "❌ Admin only. That command is for VIPs! 🚫")
+            send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
         if not args:
             send_message(user_id,
@@ -1127,34 +1130,34 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         try:
             target = int(args.split()[0])
         except Exception:
-            send_message(user_id, "❌ Invalid user id. Must be a number!\nExample: /unsuspend 12345678")
+            send_message(user_id, "❌ Invalid user id.\nExample: /unsuspend 12345678")
             return jsonify({"ok": True})
         ok = unsuspend_user(target)
         if ok:
-            send_message(user_id, f"✅ Unsuspended {target}. They're free! 🥳")
+            send_message(user_id, f"✅ Unsuspended {target}.")
         else:
-            send_message(user_id, f"ℹ️ User {target} was not suspended or their time already ran out. 🤷‍♂️")
+            send_message(user_id, f"ℹ️ User {target} was not suspended.")
         return jsonify({"ok": True})
 
     if command == "/listsuspended":
         if not is_admin(user_id):
-            send_message(user_id, "❌ Admin only. That command is for VIPs! 🚫")
+            send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
         rows = list_suspended()
         if not rows:
-            send_message(user_id, "✅ Woohoo! No suspended users right now! Clean slate! 🧼")
+            send_message(user_id, "✅ No suspended users.")
             return jsonify({"ok": True})
         lines = []
         for r in rows:
             uid, until_utc, reason, added_at_utc = r
             until_wat = utc_to_wat_ts(until_utc)
             added_wat = utc_to_wat_ts(added_at_utc)
-            lines.append(f"⛔ {uid} - Until: {until_wat} - Reason: {reason or '(none)'} - Added: {added_wat}")
-        send_message(user_id, "🚫 **Currently Suspended Users:**\n" + "\n".join(lines))
+            lines.append(f"⛔ {uid} until={until_wat} reason={reason or '(none)'} added={added_wat}")
+        send_message(user_id, "⛔ Suspended:\n" + "\n".join(lines))
         return jsonify({"ok": True})
 
     # Unknown
-    send_message(user_id, "❓ Hmm, I don't recognize that command! Try /start or /status. 🧐")
+    send_message(user_id, "🤔 Unknown command.")
     return jsonify({"ok": True})
 
 def handle_user_text(user_id: int, username: str, text: str):
@@ -1164,7 +1167,7 @@ def handle_user_text(user_id: int, username: str, text: str):
         return jsonify({"ok": True})
         
     if not is_allowed(user_id):
-        send_message(user_id, "❌ You are not allowed to use this bot. Owner (@justmemmy) has been notified. 🥺")
+        send_message(user_id, "❌ You are not allowed. Owner (@justmemmy) notified. 🥺")
         notify_owners(f"Unallowed access by {user_id}.")
         return jsonify({"ok": True})
     if is_suspended(user_id):
@@ -1174,15 +1177,15 @@ def handle_user_text(user_id: int, username: str, text: str):
             r = c.fetchone()
             until_utc = r[0] if r else "unknown"
             until_wat = utc_to_wat_ts(until_utc)
-        send_message(user_id, f"🚫 Oh no! You're suspended until *{until_wat}*. Please wait patiently! 🙏")
+        send_message(user_id, f"⛔ Suspended until *{until_wat}*.")
         return jsonify({"ok": True})
     res = enqueue_task(user_id, username, text)
     if not res["ok"]:
         if res["reason"] == "empty":
-            send_message(user_id, "😅 Oops! I couldn't find any words in that message. Try sending some proper text! 📝")
+            send_message(user_id, "🧐 No words found. Send longer text.")
             return jsonify({"ok": True})
         if res["reason"] == "queue_full":
-            send_message(user_id, f"🛑 Queue full! 😓 You already have *{res['queue_size']}* tasks waiting. Please wait a bit or use /stop to clear your queue. ⏳")
+            send_message(user_id, f"🛑 Queue full ({res['queue_size']}). Use /stop.")
             return jsonify({"ok": True})
     running = None
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -1192,9 +1195,10 @@ def handle_user_text(user_id: int, username: str, text: str):
         c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
         queued = c.fetchone()[0]
     if running:
-        send_message(user_id, f"📝 Added to your queue! Position: *{queued}*. I'll get to it after your current task finishes! 🏃‍♂️")
+        send_message(user_id, f"📝 Queued. Position in queue: {queued}.")
     else:
-        send_message(user_id, f"🥳 **Task Accepted!** I'm starting on your *{res['total_words']}* words right away! 🤩")
+        # Added star formatting to total_words and a nice emoji
+        send_message(user_id, f"🚀 Task accepted — will split *{res['total_words']}* words. ✨")
     return jsonify({"ok": True})
 
 # Webhook setup helper
