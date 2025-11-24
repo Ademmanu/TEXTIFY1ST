@@ -14,8 +14,11 @@ Features implemented per user request:
 - Timestamps formatted as "YYYY-MM-DD HH:MM:SS" (in UTC for database)
 - Time displays converted to WAT (Nigeria Time) for user-facing messages
 - Added Scheduled Maintenance (3:00 AM - 4:00 AM WAT)
-- Added /mem and /sysmem endpoints for memory usage checking
-- Implemented batch updates for sent_count to fix database inefficiency.
+- Added /mem and /sysmem endpoints for memory usage checking (psutil)
+- Fixed database inefficiency by reverting to per-word updates to satisfy /status requirement.
+- Maintenance now stops/cancels running tasks, not pauses them.
+- Fixed redundant maintenance notifications for suspended users.
+- Owner tag (@justmemmy) and emojis are consistently applied.
 """
 
 import os
@@ -32,7 +35,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
 import requests
 import traceback
-import psutil # Added for memory check
+import psutil
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -369,7 +372,8 @@ def start_maintenance():
     with _maintenance_lock:
         _is_maintenance = True
     stopped = cancel_all_tasks()
-    msg = f"⚠️ Maintenance Started! ⚠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe stopped {stopped} pending tasks. Please try again after 4:00 AM WAT. Thank you for your patience! 🙏"
+    # Updated message to reflect cancellation (Fix #2)
+    msg = f"⚠️ Maintenance Started! ⚠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tasks. Please try again after 4:00 AM WAT. Thank you for your patience! 🙏"
     broadcast_to_all_allowed(msg)
     logger.info("Maintenance started. All tasks cancelled.")
 
@@ -405,6 +409,7 @@ def enqueue_task(user_id: int, username: str, text: str):
 def get_next_task_for_user(user_id: int):
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
+        # The global worker only pulls 'queued' tasks
         c.execute("SELECT id, words_json, total_words, text FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
         r = c.fetchone()
     if not r:
@@ -521,6 +526,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
     if not lock.acquire(blocking=False):
         return
     try:
+        # Check suspension/maintenance immediately upon starting task thread
         if is_suspended(user_id):
             try:
                 send_message(user_id, "⛔ You are suspended — tasks won't run until suspension ends. 😔")
@@ -528,25 +534,28 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                 pass
             return
         
-        # Open DB connection for the duration of this user's task processing, under lock
-        with _db_lock:
-            db_conn = sqlite3.connect(DB_PATH, timeout=30)
-            db_cursor = db_conn.cursor()
+        if is_maintenance_time():
+            # If maintenance starts just as the task is about to run (after global worker pulled it)
+            try:
+                 send_message(user_id, "🚧 Maintenance in Progress! 🚧\n\nTask cannot start now (3:00 AM - 4:00 AM WAT). Please try again after 4:00 AM WAT. 🙏")
+            except Exception:
+                pass
+            return
 
         while True:
-            if is_maintenance_time():
-                logger.info("Task processing stopped for user %s due to maintenance.", user_id)
-                send_message(user_id, "🚧 Task paused due to maintenance (3:00 AM - 4:00 AM WAT). Will resume automatically. 😴")
-                # Change active task status to 'paused'
-                db_cursor.execute("UPDATE tasks SET status = 'paused' WHERE user_id = ? AND status = 'running'", (user_id,))
-                db_conn.commit()
-                break # Break inner while to release lock and exit thread
-            
             task = get_next_task_for_user(user_id)
             if not task:
                 break
+                
+            # Re-check just in case suspension/maintenance was activated between task pull and lock acquire
             if is_suspended(user_id):
                 send_message(user_id, "⛔ You are suspended. Tasks paused/cancelled. 🛑")
+                set_task_status(task["id"], "cancelled") 
+                break
+            
+            if is_maintenance_time():
+                send_message(user_id, "🛑 Task stopped due to maintenance (3:00 AM - 4:00 AM WAT). Please try again after 4:00 AM WAT. 🙏")
+                set_task_status(task["id"], "cancelled")
                 break
             
             task_id = task["id"]
@@ -555,8 +564,10 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             set_task_status(task_id, "running")
             
             # Retrieve current sent count
-            db_cursor.execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,))
-            sent_info = db_cursor.fetchone()
+            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                c = conn.cursor()
+                c.execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,))
+                sent_info = c.fetchone()
             sent = int(sent_info[0] or 0) if sent_info else 0
             
             remaining = max(0, total - sent)
@@ -567,30 +578,41 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
             
             i = sent
             consecutive_failures = 0
-            words_since_last_commit = 0 # NEW: Batch update tracker
             
             while i < total:
                 
-                # Re-check for maintenance/suspension mid-task
-                if is_maintenance_time() or is_suspended(user_id):
-                    # Pausing task and notifying user before breaking out
-                    db_cursor.execute("UPDATE tasks SET status = 'paused' WHERE id = ?", (task_id,))
-                    db_conn.commit()
-                    send_message(chat_id, "🚧 Task paused due to maintenance (3:00 AM - 4:00 AM WAT). Will resume automatically. 😴")
-                    break
-                    
-                # Check task status for external pause/cancel
-                db_cursor.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
-                row = db_cursor.fetchone()
+                # Check task status for external pause/cancel/suspension/maintenance
+                row = None
+                with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
+                    row = c.fetchone()
                 if not row:
                     break
                 status = row[0]
                 
+                # IMPORTANT: Priority Check for immediate termination
+                if status == "cancelled":
+                    break
+                
+                if is_suspended(user_id):
+                    # Only notify if the task was running and is being forcibly stopped by suspension status change
+                    send_message(chat_id, "⛔ Your task was stopped because your account was suspended. 🛑")
+                    set_task_status(task_id, "cancelled")
+                    break
+                
+                if is_maintenance_time():
+                    # Only notify if the user is NOT suspended (Fix #3)
+                    if not is_suspended(user_id):
+                         send_message(chat_id, "🛑 Task stopped due to maintenance (3:00 AM - 4:00 AM WAT). Please try again after 4:00 AM WAT. 🙏")
+                    set_task_status(task_id, "cancelled")
+                    break # Break sending loop (Fix #2)
+
+                # Pause handling (allows external /resume)
                 if status == "paused":
                     send_message(chat_id, "⏸️ Paused. Use /resume to continue.")
-                    # In this PAUSED state, we MUST release the DB lock inside the thread.
-                    db_conn.close() # Close the connection
                     
+                    # Wait loop
                     while True:
                         time.sleep(0.5)
                         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn_check:
@@ -598,30 +620,28 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                             c_check.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
                             row2 = c_check.fetchone()
                         
-                        if not row2:
-                            break
-                        if row2[0] == "running":
+                        if not row2: break
+                        new_status = row2[0]
+
+                        # Handle termination events during pause
+                        if new_status == "cancelled" or is_suspended(user_id) or is_maintenance_time():
+                            if is_suspended(user_id):
+                                set_task_status(task_id, "cancelled")
+                                send_message(chat_id, "⛔ Task stopped because your account was suspended. 🛑")
+                            elif is_maintenance_time():
+                                set_task_status(task_id, "cancelled")
+                                # Only notify if not suspended
+                                if not is_suspended(user_id):
+                                    send_message(chat_id, "🛑 Task stopped due to maintenance (3:00 AM - 4:00 AM WAT). 🙏")
+                            break # Break inner wait loop and send loop
+
+                        if new_status == "running":
                             send_message(chat_id, "▶️ Resuming.")
-                            
-                            # Re-acquire connection before resuming the send loop
-                            with _db_lock:
-                                db_conn = sqlite3.connect(DB_PATH, timeout=30)
-                                db_cursor = db_conn.cursor()
-                            break
-                        
-                        if row2[0] == "cancelled":
-                            break
-                        
-                        if is_maintenance_time():
-                            send_message(chat_id, "🚧 Maintenance started. Task remains paused. 😴")
                             break
 
-                    if (row2 and row2[0] == "cancelled") or is_maintenance_time():
+                    if new_status in ("cancelled", "paused"): # If it's still paused or terminated, break
                         break
                         
-                if status == "cancelled":
-                    break
-                    
                 # Send the word
                 res = send_message(chat_id, words[i])
                 if res is None:
@@ -634,52 +654,38 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
                     consecutive_failures = 0
                 
                 i += 1
-                words_since_last_commit += 1
                 
-                # BATCH UPDATE: Commit sent_count every 10 words or when task is ending
-                if words_since_last_commit >= 10 or i == total: 
-                    db_cursor.execute("UPDATE tasks SET sent_count = ? WHERE id = ?", (i, task_id))
-                    db_conn.commit()
-                    words_since_last_commit = 0
+                # IMMEDIATE UPDATE: Commit sent_count for immediate /status accuracy (Fix #1)
+                with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                    c = conn.cursor()
+                    c.execute("UPDATE tasks SET sent_count = ? WHERE id = ?", (i, task_id))
+                    conn.commit()
                     
                 time.sleep(interval)
             
             # finalize outside inner loop
-            if i < total and status in ("paused", "cancelled"):
-                # Task paused/cancelled externally or due to maintenance
-                if status == "cancelled":
-                    send_message(chat_id, "🛑 Task stopped.")
-                continue # Process next task (or break if no more queued)
             
-            # Task finished successfully
-            db_cursor.execute("SELECT status, sent_count FROM tasks WHERE id = ?", (task_id,))
-            r = db_cursor.fetchone()
+            # Check status again to see if it was cancelled/stopped
+            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                c = conn.cursor()
+                c.execute("SELECT status, sent_count FROM tasks WHERE id = ?", (task_id,))
+                r = c.fetchone()
             
-            # This should only happen if the task was already marked 'cancelled' by a failure handler.
             final_status = r[0] if r else "done" 
             
-            if final_status != "cancelled":
+            if final_status not in ("cancelled", "paused"): # If not manually stopped or paused, it's done.
                 set_task_status(task_id, "done")
                 record_split_log(user_id, username, i) # Record total words sent (i)
                 send_message(chat_id, "✅ Done! Your text was split. ✨")
-            else:
+            elif final_status == "cancelled":
                 send_message(chat_id, "🛑 Task stopped.")
+            elif final_status == "paused":
+                # Do nothing, message was already sent
+                pass
             
-            # Ensure the connection is closed here if it was open for the finished task.
-            if db_conn:
-                db_conn.close()
-                
             continue # Process next task
             
     finally:
-        # Final cleanup for the thread. If the loop broke before closing the connection
-        # (e.g., due to an exception outside the inner loops), close it now.
-        try:
-            db_conn.close()
-        except NameError:
-            pass # Connection was never opened or already closed
-        except Exception:
-            pass # Catch any other close error
         lock.release()
 
 def global_worker():
@@ -690,8 +696,8 @@ def global_worker():
         try:
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
-                # Also include 'paused' tasks if maintenance is over (to re-kick them)
-                c.execute("SELECT DISTINCT user_id, username FROM tasks WHERE status IN ('queued', 'paused') ORDER BY created_at ASC")
+                # Only pull 'queued' tasks (the 'paused' tasks will wait until a user manually resumes them)
+                c.execute("SELECT DISTINCT user_id, username FROM tasks WHERE status IN ('queued') ORDER BY created_at ASC")
                 rows = c.fetchall()
             for r in rows:
                 uid = r[0]
@@ -800,7 +806,6 @@ def webhook():
 
 @app.route("/", methods=["GET"])
 def root():
-    # Added 💚
     return "WordSplitter running. 💚", 200
 
 @app.route("/health", methods=["GET", "HEAD"])
@@ -895,6 +900,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if active:
             aid, status, total, sent = active
             remaining = int(total or 0) - int(sent or 0)
+            # This remaining count is now immediate (Fix #1)
             send_message(user_id, f"⚙️ Status: {status.capitalize()}. Remaining: *{remaining}* words. 📝 Queue: {queued}")
         else:
             send_message(user_id, f"✅ No active tasks. 📝 Queue: {queued}")
