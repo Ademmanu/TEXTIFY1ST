@@ -403,7 +403,12 @@ def start_maintenance():
     with _maintenance_lock:
         _is_maintenance = True
     stopped = cancel_all_tasks()
-    msg = f"⚠️ Maintenance Started! 🛠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tasks. All tasks submitted during maintenance are terminated and will not run after maintenance. Please try again after 4:00 AM WAT."
+    msg = (
+        f"⚠️ Maintenance Started! 🛠️\n\n"
+        "The WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\n"
+        f"We *stopped* {stopped} pending tasks. All queued and running tasks have been cancelled and will not resume.\n\n"
+        "Please try again after the maintenance window. Thank you for your patience! 🙏"
+    )
     broadcast_to_all_allowed(msg)
     logger.info("Maintenance started. All tasks cancelled: %s", stopped)
 
@@ -592,15 +597,30 @@ def is_user_active(uid: int) -> bool:
     with _active_users_lock:
         return uid in _active_users
 
+def try_mark_user_active(uid: int) -> bool:
+    """
+    Atomically check-and-set the active-user flag.
+    Returns True if we successfully marked the user active (i.e. no other worker was active),
+    False if the user was already active.
+    This prevents the race where multiple worker threads start concurrently for the same user.
+    """
+    with _active_users_lock:
+        if uid in _active_users:
+            return False
+        _active_users.add(uid)
+        return True
+
 # Worker logic: per-user sequential processing, but limited concurrent users by executor
 def process_user_queue(user_id: int):
     """
     Runs in executor thread for a single user; processes that user's queued tasks sequentially.
     Ensures only one executor thread handles a given user at a time.
     """
-    if is_user_active(user_id):
+    # Attempt to become the single active worker for this user. If another worker is already
+    # active, exit immediately (the other worker will process the queued tasks).
+    if not try_mark_user_active(user_id):
         return
-    mark_user_active(user_id)
+
     try:
         # If suspended, cancel queued tasks for that user
         if is_suspended(user_id):
@@ -725,6 +745,7 @@ def process_user_queue(user_id: int):
                 send_message(user_id, "🛑 Task stopped.")
             # continue to next queued task for this user (sequential)
     finally:
+        # ensure we always clear the active marker so another queued worker can start
         unmark_user_active(user_id)
 
 # Dispatcher thread: scans queued users and submits per-user workers to executor up to concurrency cap
