@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 WordSplitter Telegram Bot (FULLY INTEGRATED—matches owner specification exactly)
-Features & commands per spec: owner-only, queue=5, Nigeria-time 2-3 AM maintenance, usernames always shown in stats/listings, no daily word cap, detailed emojis.
+Features & commands per spec: owner-only, queue=5, Nigeria-time 2-3 AM maintenance, usernames always shown in stats/listings,
+no daily word cap, detailed emojis.
+
+OWNER_USERNAMES logic REMOVED.
 """
 
 import os
@@ -28,7 +31,6 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 OWNER_IDS_RAW = os.environ.get("OWNER_IDS", "")  # comma/space separated IDs
-OWNER_USERNAMES_RAW = os.environ.get("OWNER_USERNAMES", "")
 DB_PATH = os.environ.get("DB_PATH", "botdata.sqlite3")
 MAX_ALLOWED_USERS = int(os.environ.get("MAX_ALLOWED_USERS", "500"))
 MAX_QUEUE_PER_USER = int(os.environ.get("MAX_QUEUE_PER_USER", "5"))  # STRICT: max queue=5
@@ -52,7 +54,6 @@ def parse_id_list(raw: str) -> List[int]:
     return ids
 
 OWNER_IDS = parse_id_list(OWNER_IDS_RAW)
-OWNER_USERNAMES = [s for s in (OWNER_USERNAMES_RAW.split(",") if OWNER_USERNAMES_RAW else []) if s]
 PRIMARY_OWNER = OWNER_IDS[0] if OWNER_IDS else None
 
 NIGERIA_TZ_OFFSET = timedelta(hours=1)
@@ -204,8 +205,7 @@ def init_db():
 init_db()
 
 # Ensure owners are auto-added and not suspended
-for idx, oid in enumerate(OWNER_IDS):
-    uname = OWNER_USERNAMES[idx] if idx < len(OWNER_USERNAMES) else ""
+for oid in OWNER_IDS:
     try:
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
@@ -214,7 +214,7 @@ for idx, oid in enumerate(OWNER_IDS):
         if not exists:
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
-                c.execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", (oid, uname, now_ts()))
+                c.execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", (oid, "", now_ts()))
                 conn.commit()
     except Exception:
         logger.exception("Error ensuring owner in allowed_users")
@@ -236,7 +236,7 @@ def acquire_token(timeout=10.0):
                 return True
         if time.time() - start >= timeout:
             return False
-        time.sleep(0.02)  # reduce busy CPU
+        time.sleep(0.02)
 
 def parse_telegram_json(resp):
     try:
@@ -350,9 +350,7 @@ def start_maintenance():
     with _maintenance_lock:
         _is_maintenance = True
     stopped = cancel_all_tasks()
-    # Notifies all users
     broadcast_to_all_allowed("🛠️ Scheduled maintenance started (2:00 AM–3:00 AM). Tasks are temporarily blocked. Please try later.")
-    # Notifies owners
     notify_owners("🛠️ Automatic maintenance started. Bot tasks were blocked.")
     logger.info("Maintenance started. All tasks cancelled: %s", stopped)
 
@@ -381,7 +379,6 @@ def enqueue_task(user_id: int, username: str, text: str):
         pending = c.fetchone()[0]
         if pending >= MAX_QUEUE_PER_USER:
             return {"ok": False, "reason": "queue_full", "queue_size": pending}
-    # insert task
     try:
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
@@ -804,8 +801,8 @@ def get_queued_for_user(user_id: int) -> int:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
         return c.fetchone()[0]
+
 def handle_command(user_id: int, username: str, command: str, args: str):
-    # Only OWNER commands: always check via OWNER_IDS
     def is_owner(u): return u in OWNER_IDS
 
     if command == "/start":
