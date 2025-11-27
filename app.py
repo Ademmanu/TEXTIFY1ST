@@ -13,16 +13,14 @@ Features:
 
 Notes on this revision:
 - Removed all message text styling (no parse_mode is sent).
-- Automatically marks numeric IDs in outgoing messages as monospace (code)
-  using the "entities" field so IDs are copyable while the rest of the
-  message remains plain text.
 - Adds "mention" entities for @usernames so they become clickable in Telegram.
-  (We add entities of type "mention" for ASCII @username tokens up to 32 chars.)
+- Marks numeric IDs as "code" entities so they're copyable (monospace).
+- Ensures entities do not overlap.
 - Removed display of task IDs everywhere in user-facing messages.
 - Usernames are displayed with an "@" prefix everywhere they are shown.
 - Owner references now include "(@justmemmy)".
-- Unauthorized user notifications to the user include their numeric ID; no other messages show user or task IDs to users.
-- Replies and notifications have more emoji for clarity.
+- Unauthorized user notifications to the user include their numeric ID (and it will be sent as code so it is copyable).
+- Replies and notifications have emoji for clarity.
 """
 
 import os
@@ -314,10 +312,9 @@ def parse_telegram_json(resp):
 def _build_entities_for_text(text: str):
     """
     Build a list of Telegram message entities for:
-    - plain numeric tokens -> type "code" (same as before)
-    - @username tokens -> type "mention" so they become clickable in Telegram
-
-    We scan for mentions first, then numbers, avoiding overlapping spans.
+    - @username tokens -> type "mention" (clickable username links)
+    - plain numeric tokens -> type "code" (monospace, copyable)
+    We avoid overlapping spans.
     Offsets/lengths use UTF-16 code units; for ASCII characters this matches Python indices.
     """
     if not text:
@@ -352,8 +349,7 @@ def _build_entities_for_text(text: str):
 
 def _build_code_entities_for_numbers(text: str):
     """
-    Legacy helper: mark numeric tokens as code. Kept for backward compatibility
-    but send_message now uses _build_entities_for_text instead.
+    Legacy helper: mark numeric tokens as code. Kept for backward compatibility.
     """
     entities = []
     for m in re.finditer(r"\b\d+\b", text):
@@ -409,8 +405,8 @@ def reset_failures(user_id: int):
 
 def send_message(chat_id: int, text: str):
     """
-    Send plain text (no parse_mode). Numeric IDs and @usernames inside the text are
-    marked as message entities (code and mention respectively) so they are copyable/clickable.
+    Send plain text (no parse_mode). @usernames will be marked 'mention' (clickable),
+    numeric IDs will be marked 'code' (monospace) so they are copyable.
     """
     if not TELEGRAM_API:
         logger.error("No TELEGRAM_TOKEN; cannot send message.")
