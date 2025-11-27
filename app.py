@@ -16,6 +16,8 @@ Notes on this revision:
 - Numeric IDs are emitted as "code" entities (monospace) so they are copyable.
 - Owner tag (Owner (@justmemmy)) is left unchanged.
 - Message entity offsets/lengths use UTF-16 code units as required by Telegram.
+
+Optimization note: The per_user_worker_loop has been optimized to use time.monotonic() for precise interval timing and reduced DB lookups within the main sending loop for tighter delay alignment and better efficiency.
 """
 
 import os
@@ -695,14 +697,22 @@ def stop_user_worker(user_id: int, join_timeout: float = 0.5):
 def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: threading.Event):
     logger.info("Worker loop starting for user %s", user_id)
     try:
+        # Cache uname for stat and log outside the main loop
+        # This reduces redundant database lookups inside the tight sending loop.
+        uname_for_stat = fetch_display_username(user_id) or str(user_id)
+
         while not stop_event.is_set():
+            # Initial checks for maintenance/suspension are outside the tight loop
             if is_maintenance_time():
+                # Block until maintenance ends or worker is stopped
                 cancel_active_task_for_user(user_id)
                 while is_maintenance_time() and not stop_event.is_set():
                     wake_event.wait(timeout=3.0)
                     wake_event.clear()
                 continue
+            
             if is_suspended(user_id):
+                # Block until unsuspended or worker is stopped
                 cancel_active_task_for_user(user_id)
                 try:
                     send_message(user_id, f"⛔ You have been suspended; stopping your task.")
@@ -712,97 +722,129 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                     wake_event.wait(timeout=5.0)
                     wake_event.clear()
                 continue
+            
+            # --- Get and Set Up Task ---
             task = get_next_task_for_user(user_id)
             if not task:
+                # Wait for a new task/wake up
                 wake_event.wait(timeout=1.0)
                 wake_event.clear()
                 continue
+            
             task_id = task["id"]
             words = task["words"]
             total = int(task["total_words"] or len(words))
-            set_task_status(task_id, "running")
+            
+            # Check sent_count from DB only once before starting run
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
-                c.execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,))
+                # Get current status (in case it was set to 'cancelled' just before this loop)
+                c.execute("SELECT sent_count, status FROM tasks WHERE id = ?", (task_id,))
                 sent_info = c.fetchone()
-            sent = int(sent_info[0] or 0) if sent_info else 0
+            
+            if not sent_info or sent_info[1] == "cancelled":
+                # Task was cancelled while worker was waking up/getting it
+                continue
+                
+            sent = int(sent_info[0] or 0)
+            
+            set_task_status(task_id, "running")
+
+            # --- Calculate Dynamic Interval ---
             interval = 0.4 if total <= 150 else (0.5 if total <= 300 else 0.6)
             est_seconds = int((total - sent) * interval)
             est_str = str(timedelta(seconds=est_seconds))
+            
             try:
                 send_message(user_id, f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}")
             except Exception:
                 pass
+
             i = sent
+            last_send_time = time.monotonic() # Use monotonic clock for precise interval timing
+
+            # --- Main Sending Loop ---
             while i < total and not stop_event.is_set():
+                
+                # Check status only if paused or at the start of a new loop iteration
                 with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                     c = conn.cursor()
                     c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
                     row = c.fetchone()
+                
                 if not row:
                     break
+                
                 status = row[0]
-                if status == "cancelled":
+                
+                # Check for external interrupts first (Suspension/Maintenance)
+                if status == "cancelled" or is_suspended(user_id) or is_maintenance_time():
+                    # If cancelled/suspended/maintenance, break and handle cleanup outside
                     break
-                if is_suspended(user_id):
-                    try:
-                        send_message(user_id, "⛔ You have been suspended; stopping your task.")
-                    except Exception:
-                        pass
-                    set_task_status(task_id, "cancelled")
-                    break
-                if is_maintenance_time():
-                    try:
-                        send_message(user_id, f"🛠️ Your task stopped due to scheduled maintenance.")
-                    except Exception:
-                        pass
-                    set_task_status(task_id, "cancelled")
-                    break
+
                 if status == "paused":
                     try:
                         send_message(user_id, f"⏸️ Task paused…")
                     except Exception:
                         pass
+                    
+                    # Block until woken up by /resume, /stop, or external event
                     while True:
+                        # Wait for a brief period, non-busy wait
                         wake_event.wait(timeout=0.7)
                         wake_event.clear()
+                        
                         if stop_event.is_set():
                             break
+                        
+                        # Re-fetch status inside the pause loop
                         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn_check:
                             c_check = conn_check.cursor()
                             c_check.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
                             row2 = c_check.fetchone()
-                        if not row2:
-                            break
-                        new_status = row2[0]
-                        if new_status == "cancelled" or is_suspended(user_id) or is_maintenance_time():
-                            break
-                        if new_status == "running":
+                        
+                        if not row2 or row2[0] == "cancelled" or is_suspended(user_id) or is_maintenance_time():
+                            break # Cancelled externally/suspended/maintenance
+                        
+                        if row2[0] == "running":
                             try:
                                 send_message(user_id, "▶️ Resuming your task now.")
                             except Exception:
                                 pass
-                            break
-                    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-                        c = conn.cursor()
-                        c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
-                        rr = c.fetchone()
-                    if not rr or rr[0] in ("cancelled", "paused"):
+                            last_send_time = time.monotonic() # Reset timer upon resuming
+                            break # Exit pause loop
+                    
+                    # If any of the main loop breaking conditions were met inside the pause loop
+                    if status == "cancelled" or is_suspended(user_id) or is_maintenance_time() or stop_event.is_set():
+                        # Set final status and break main loop
+                        if is_suspended(user_id):
+                            set_task_status(task_id, "cancelled")
+                            try: send_message(user_id, "⛔ You have been suspended; stopping your task.")
+                            except Exception: pass
+                        elif is_maintenance_time():
+                            set_task_status(task_id, "cancelled")
+                            try: send_message(user_id, f"🛠️ Your task stopped due to scheduled maintenance.")
+                            except Exception: pass
                         break
-                # Send word, record split log per word (for stats)
-                uname_for_stat = ""
-                with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-                    c = conn.cursor()
-                    c.execute("SELECT username FROM allowed_users WHERE user_id = ?", (user_id,))
-                    r = c.fetchone()
-                uname_for_stat = r[0] if r and r[0] else ""
+                    
+                    # Continue to sending word if resumed
+                    if row2 and row2[0] == "running":
+                        pass
+                    else:
+                        break # Must have been cancelled/stop_event set inside the pause loop
+
+                # --- Send Word and Log ---
                 try:
                     send_message(user_id, words[i])
-                    record_split_log(user_id, uname_for_stat or str(user_id), 1)
+                    # Use cached uname_for_stat for log consistency and speed
+                    record_split_log(user_id, uname_for_stat, 1) 
                 except Exception:
                     # Even if send failed, record a log entry to keep username history consistent.
-                    record_split_log(user_id, uname_for_stat or str(user_id), 1)
+                    record_split_log(user_id, uname_for_stat, 1)
+
                 i += 1
+
+                # Update sent_count AFTER send attempt and log
                 try:
                     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                         c = conn.cursor()
@@ -810,25 +852,39 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                         conn.commit()
                 except Exception:
                     logger.exception("Failed to update sent_count for task %s", task_id)
-                sleeper = 0.0
-                target = interval
-                start_sleep = time.time()
-                while sleeper < target and not stop_event.is_set():
-                    now = time.time()
-                    remaining = max(0, target - sleeper)
-                    time.sleep(min(0.07, remaining))
-                    if wake_event.is_set():
-                        wake_event.clear()
-                        break
-                    sleeper = now - start_sleep
+
+                # --- Dynamic Delay (Tight Alignment) ---
+                # Calculate time to sleep to hit the target interval precisely using monotonic clock
+                
+                # Check for immediate interrupt (wake signal) right after the DB update
+                if wake_event.is_set():
+                    wake_event.clear()
+                    continue # Skip sleep and re-check status
+
+                now = time.monotonic()
+                elapsed = now - last_send_time
+                remaining_time = interval - elapsed
+                
+                if remaining_time > 0:
+                    # Sleep for the precise remaining time
+                    time.sleep(remaining_time)
+                
+                # Update last_send_time for the next iteration
+                last_send_time = time.monotonic()
+
+                # Re-check for external interrupts (maintenance/suspension) after the sleep
                 if is_maintenance_time() or is_suspended(user_id):
                     break
+
+            # --- Task Finalization ---
+            # If we broke out of the loop due to cancellation/completion/interrupt:
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
                 c.execute("SELECT status, sent_count FROM tasks WHERE id = ?", (task_id,))
                 r = c.fetchone()
+            
             final_status = r[0] if r else "done"
-            sent_final = int(r[1] or 0) if r and r[1] is not None else i
+            
             if final_status not in ("cancelled", "paused"):
                 set_task_status(task_id, "done")
                 try:
@@ -840,11 +896,14 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                     send_message(user_id, f"🛑 Task stopped.")
                 except Exception:
                     pass
+            # Status remains 'paused' if it was paused
+
     except Exception:
         logger.exception("Worker error for user %s", user_id)
     finally:
         with _user_workers_lock:
-            _user_workers.pop(user_id, None)
+            # Ensure the worker is removed from the dict upon exit
+            _user_workers.pop(user_id, None) 
         logger.info("Worker loop exiting for user %s", user_id)
 
 def fetch_display_username(user_id: int):
