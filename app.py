@@ -2,12 +2,12 @@
 """
 Final integrated Telegram Word-Splitter Bot (app.py)
 
-Updates:
-- Fixed maintenance mode logic to strictly prevent execution between 3-4 AM WAT.
-- Fixed username recording in split_logs for accurate reporting.
-- Added username display to /listusers, /botinfo stats, and hourly reports.
-- improved /suspend and /unsuspend usage messages.
-- Auto-updates username in DB on interaction.
+This version:
+- Reworked task execution model: per-user worker threads (one worker per user).
+- Removed dispatcher and global active_users system which caused duplicate concurrent tasks.
+- Each user worker processes their queued tasks strictly FIFO and only one at a time.
+- /stop, /pause, /resume operate on the active task and queued tasks as described.
+- Most other features kept unchanged.
 """
 
 import os
@@ -70,7 +70,6 @@ PRIMARY_OWNER = OWNER_IDS[0] if OWNER_IDS else None
 NIGERIA_TZ_OFFSET = timedelta(hours=1)
 def now_ts() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
 def utc_to_wat_ts(utc_ts: str) -> str:
     try:
         utc_dt = datetime.strptime(utc_ts, "%Y-%m-%d %H:%M:%S")
@@ -82,20 +81,9 @@ def utc_to_wat_ts(utc_ts: str) -> str:
 # Maintenance state
 _is_maintenance = False
 _maintenance_lock = threading.Lock()
-
 def is_maintenance_time() -> bool:
-    # 1. Check manual flag
     with _maintenance_lock:
-        if _is_maintenance:
-            return True
-    
-    # 2. Strict Backup: Check Actual Time (3:00 AM - 4:00 AM WAT)
-    # WAT is UTC+1. So 3:00 WAT is 2:00 UTC.
-    now_utc = datetime.utcnow()
-    # Check if between 02:00 UTC and 03:00 UTC
-    if now_utc.hour == 2:
-        return True
-    return False
+        return _is_maintenance
 
 # DB helpers and init
 _db_lock = threading.Lock()
@@ -172,13 +160,56 @@ def init_db():
         try:
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
-                # Re-create tables for memory db
-                c.execute("""CREATE TABLE IF NOT EXISTS allowed_users (user_id INTEGER PRIMARY KEY, username TEXT, added_at TEXT, is_admin INTEGER DEFAULT 0)""")
-                c.execute("""CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, text TEXT, words_json TEXT, total_words INTEGER, sent_count INTEGER DEFAULT 0, status TEXT, created_at TEXT, started_at TEXT, finished_at TEXT)""")
-                c.execute("""CREATE TABLE IF NOT EXISTS split_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, words INTEGER, created_at TEXT)""")
-                c.execute("""CREATE TABLE IF NOT EXISTS sent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, message_id INTEGER, sent_at TEXT, deleted INTEGER DEFAULT 0)""")
-                c.execute("""CREATE TABLE IF NOT EXISTS suspended_users (user_id INTEGER PRIMARY KEY, suspended_until TEXT, reason TEXT, added_at TEXT)""")
-                c.execute("""CREATE TABLE IF NOT EXISTS send_failures (user_id INTEGER PRIMARY KEY, failures INTEGER, last_failure_at TEXT)""")
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    added_at TEXT,
+                    is_admin INTEGER DEFAULT 0
+                )""")
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    username TEXT,
+                    text TEXT,
+                    words_json TEXT,
+                    total_words INTEGER,
+                    sent_count INTEGER DEFAULT 0,
+                    status TEXT,
+                    created_at TEXT,
+                    started_at TEXT,
+                    finished_at TEXT
+                )""")
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS split_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    username TEXT,
+                    words INTEGER,
+                    created_at TEXT
+                )""")
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS sent_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER,
+                    message_id INTEGER,
+                    sent_at TEXT,
+                    deleted INTEGER DEFAULT 0
+                )""")
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS suspended_users (
+                    user_id INTEGER PRIMARY KEY,
+                    suspended_until TEXT,
+                    reason TEXT,
+                    added_at TEXT
+                )""")
+                c.execute("""
+                CREATE TABLE IF NOT EXISTS send_failures (
+                    user_id INTEGER PRIMARY KEY,
+                    failures INTEGER,
+                    last_failure_at TEXT
+                )""")
                 conn.commit()
             logger.info("In-memory DB initialized")
         except Exception:
@@ -186,30 +217,48 @@ def init_db():
 
 init_db()
 
-# Ensure owners are admins
+# Ensure owners are admins in allowed_users
 for idx, oid in enumerate(OWNER_IDS):
     uname = OWNER_USERNAMES[idx] if idx < len(OWNER_USERNAMES) else ""
     try:
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
-                      (oid, uname, now_ts(), 1))
-            conn.commit()
+            c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (oid,))
+            exists = c.fetchone()
+        if not exists:
+            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                c = conn.cursor()
+                c.execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                          (oid, uname, now_ts(), 1))
+                conn.commit()
+        else:
+            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                c = conn.cursor()
+                c.execute("UPDATE allowed_users SET is_admin = 1 WHERE user_id = ?", (oid,))
+                conn.commit()
     except Exception:
         logger.exception("Error ensuring owner in allowed_users")
 
-# Helper to update username on interaction
-def update_user_info(user_id: int, username: str):
-    if not username: 
-        return
+# Auto-add ALLOWED_USERS env var
+for uid in parse_id_list(ALLOWED_USERS_RAW):
     try:
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
-            # Only update if user exists to avoid adding unallowed users
-            c.execute("UPDATE allowed_users SET username = ? WHERE user_id = ?", (username, user_id))
-            conn.commit()
+            c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (uid,))
+            rows = c.fetchone()
+        if not rows:
+            with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+                c = conn.cursor()
+                c.execute("INSERT INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
+                          (uid, "", now_ts(), 0))
+                conn.commit()
+            try:
+                if TELEGRAM_API:
+                    _session.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": uid, "text": "You were added via ALLOWED_USERS. Hello! 🥳"}, timeout=3)
+            except Exception:
+                pass
     except Exception:
-        pass
+        logger.exception("Auto-add allowed user error")
 
 # Token bucket for normal sends
 _token_bucket = {"tokens": MAX_MSG_PER_SECOND, "last": time.time(), "capacity": max(1.0, MAX_MSG_PER_SECOND), "lock": threading.Lock()}
@@ -228,7 +277,7 @@ def acquire_token(timeout=10.0):
                 return True
         if time.time() - start >= timeout:
             return False
-        time.sleep(0.02)
+        time.sleep(0.02)  # reduce busy CPU on tiny CPUs
 
 def parse_telegram_json(resp):
     try:
@@ -348,7 +397,7 @@ def start_maintenance():
     with _maintenance_lock:
         _is_maintenance = True
     stopped = cancel_all_tasks()
-    msg = f"⚠️ Maintenance Started! 🛠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tasks. All tasks submitted during maintenance are terminated and will not run after maintenance. Please try again after 4:00 AM WAT."
+    msg = f"⚠️ Maintenance Started! 🛠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tasks."
     broadcast_to_all_allowed(msg)
     logger.info("Maintenance started. All tasks cancelled: %s", stopped)
 
@@ -376,6 +425,7 @@ def user_daily_sent(user_id: int) -> int:
         logger.exception("user_daily_sent db error")
         return 0
 
+# STRICT: Never accept new tasks during maintenance
 def enqueue_task(user_id: int, username: str, text: str):
     if is_maintenance_time():
         return {"ok": False, "reason": "maintenance"}
@@ -383,15 +433,18 @@ def enqueue_task(user_id: int, username: str, text: str):
     total = len(words)
     if total == 0:
         return {"ok": False, "reason": "empty"}
+    # enforce per-user queue limit
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
         pending = c.fetchone()[0]
         if pending >= MAX_QUEUE_PER_USER:
             return {"ok": False, "reason": "queue_full", "queue_size": pending}
+    # enforce daily word limit
     current_daily = user_daily_sent(user_id)
     if current_daily + total > DAILY_WORD_LIMIT_PER_USER:
         return {"ok": False, "reason": "daily_limit", "current": current_daily, "limit": DAILY_WORD_LIMIT_PER_USER}
+    # insert task
     try:
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
@@ -406,11 +459,18 @@ def enqueue_task(user_id: int, username: str, text: str):
 def get_next_task_for_user(user_id: int):
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
-        c.execute("SELECT id, words_json, total_words, text, username FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
+        c.execute("SELECT id, words_json, total_words, text FROM tasks WHERE user_id = ? AND status = 'queued' ORDER BY id ASC LIMIT 1", (user_id,))
         r = c.fetchone()
     if not r:
         return None
-    return {"id": r[0], "words": json.loads(r[1]) if r[1] else split_text_to_words(r[3]), "total_words": r[2], "text": r[3], "username": r[4] or ""}
+    return {"id": r[0], "words": json.loads(r[1]) if r[1] else split_text_to_words(r[3]), "total_words": r[2], "text": r[3]}
+
+def get_next_queued_users(limit: int = 100):
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT user_id FROM tasks WHERE status = 'queued' ORDER BY created_at ASC LIMIT ?", (limit,))
+        rows = c.fetchall()
+    return [r[0] for r in rows]
 
 def set_task_status(task_id: int, status: str):
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -563,49 +623,37 @@ def stop_user_worker(user_id: int, join_timeout: float = 0.5):
             _user_workers.pop(user_id, None)
             logger.info("Stopped worker for user %s", user_id)
 
+# STRICT: No task runs, queue, or processes during maintenance. Worker sleeps and rechecks instantly.
 def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: threading.Event):
     logger.info("Worker loop starting for user %s", user_id)
     try:
         while not stop_event.is_set():
-            # STRICT MAINTENANCE CHECK 1 (Loop Entry)
+            # STRICT: Do not process during maintenance and cancel all running/queued tasks
             if is_maintenance_time():
                 cancel_active_task_for_user(user_id)
-                wake_event.wait(timeout=5.0)
-                wake_event.clear()
+                while is_maintenance_time() and not stop_event.is_set():
+                    wake_event.wait(timeout=3.0)
+                    wake_event.clear()
                 continue
-
             if is_suspended(user_id):
                 cancel_active_task_for_user(user_id)
                 try:
                     send_message(user_id, "⛔ You are suspended — your queued tasks were cancelled. 🛑")
                 except Exception:
                     pass
-                wake_event.wait(timeout=5.0)
-                wake_event.clear()
+                while is_suspended(user_id) and not stop_event.is_set():
+                    wake_event.wait(timeout=5.0)
+                    wake_event.clear()
                 continue
-
             task = get_next_task_for_user(user_id)
             if not task:
                 wake_event.wait(timeout=1.0)
                 wake_event.clear()
                 continue
-            
-            # STRICT MAINTENANCE CHECK 2 (Post-Fetch)
-            # Prevent race condition if maintenance started exactly while fetching
-            if is_maintenance_time():
-                set_task_status(task["id"], "cancelled")
-                try:
-                    send_message(user_id, "🛑 Task stopped due to maintenance (3:00 AM - 4:00 AM WAT). 🙏")
-                except Exception:
-                    pass
-                continue
-
             task_id = task["id"]
             words = task["words"]
-            task_username = task["username"] # Get username for logging
             total = int(task["total_words"] or len(words))
             set_task_status(task_id, "running")
-
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
                 c.execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,))
@@ -619,20 +667,9 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 send_message(user_id, f"🚀 Starting split: *{total}* words. Est: *{est_str}*.")
             except Exception:
                 pass
-
             i = sent
             consecutive_failures = 0
             while i < total and not stop_event.is_set():
-                # STRICT MAINTENANCE CHECK 3 (Inner Loop)
-                if is_maintenance_time():
-                    if not is_suspended(user_id):
-                        try:
-                            send_message(user_id, "🛑 Task stopped due to maintenance (3:00 AM - 4:00 AM WAT). It will not restart. 🙏")
-                        except Exception:
-                            pass
-                    set_task_status(task_id, "cancelled")
-                    break
-
                 with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                     c = conn.cursor()
                     c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
@@ -649,7 +686,14 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                         pass
                     set_task_status(task_id, "cancelled")
                     break
-                
+                if is_maintenance_time():
+                    if not is_suspended(user_id):
+                        try:
+                            send_message(user_id, "🛑 Task stopped due to maintenance (3:00 AM - 4:00 AM WAT). It will not restart. 🙏")
+                        except Exception:
+                            pass
+                    set_task_status(task_id, "cancelled")
+                    break
                 if status == "paused":
                     try:
                         send_message(user_id, "⏸️ Paused. Use /resume to continue.")
@@ -660,15 +704,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                         wake_event.clear()
                         if stop_event.is_set():
                             break
-                        # Check maintenance during pause
-                        if is_maintenance_time():
-                            set_task_status(task_id, "cancelled")
-                            try:
-                                send_message(user_id, "🛑 Task stopped due to maintenance. 🙏")
-                            except Exception:
-                                pass
-                            break
-                            
                         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn_check:
                             c_check = conn_check.cursor()
                             c_check.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
@@ -676,29 +711,32 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                         if not row2:
                             break
                         new_status = row2[0]
-                        if new_status == "cancelled" or is_suspended(user_id):
-                             if is_suspended(user_id):
+                        if new_status == "cancelled" or is_suspended(user_id) or is_maintenance_time():
+                            if is_suspended(user_id):
                                 set_task_status(task_id, "cancelled")
                                 try:
                                     send_message(user_id, "⛔ Task stopped because your account was suspended. 🛑")
                                 except Exception:
                                     pass
-                             break
+                            elif is_maintenance_time():
+                                set_task_status(task_id, "cancelled")
+                                if not is_suspended(user_id):
+                                    try:
+                                        send_message(user_id, "🛑 Task stopped due to maintenance (3:00 AM - 4:00 AM WAT). 🙏")
+                                    except Exception:
+                                        pass
+                            break
                         if new_status == "running":
                             try:
                                 send_message(user_id, "▶️ Resuming.")
                             except Exception:
                                 pass
                             break
-                    # Re-verify task status after pause loop
                     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                         c = conn.cursor()
                         c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
                         rr = c.fetchone()
                     if not rr or rr[0] in ("cancelled", "paused"):
-                        break
-                    # Break outer loop if maintenance hit during pause
-                    if is_maintenance_time():
                         break
 
                 try:
@@ -713,7 +751,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                         break
                 else:
                     consecutive_failures = 0
-
                 i += 1
                 try:
                     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -723,13 +760,20 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 except Exception:
                     logger.exception("Failed to update sent_count for task %s", task_id)
 
+                # ACCURATE DELAY, IMMEDIATE RESPONSE FOR MAINTENANCE/SUSPEND
                 sleeper = 0.0
                 target = interval
+                start_sleep = time.time()
                 while sleeper < target and not stop_event.is_set():
-                    if wake_event.wait(timeout=0.15):
+                    now = time.time()
+                    remaining = max(0, target - sleeper)
+                    time.sleep(min(0.07, remaining))
+                    if wake_event.is_set():
                         wake_event.clear()
                         break
-                    sleeper += 0.15
+                    sleeper = now - start_sleep
+                if is_maintenance_time() or is_suspended(user_id):
+                    break
 
             with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                 c = conn.cursor()
@@ -739,8 +783,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             sent_final = int(r[1] or 0) if r and r[1] is not None else i
             if final_status not in ("cancelled", "paused"):
                 set_task_status(task_id, "done")
-                # CORRECTED: log the actual username here
-                record_split_log(user_id, task_username, sent_final)
+                record_split_log(user_id, "", sent_final)
                 try:
                     send_message(user_id, "✅ Done! Your text was split. ✨")
                 except Exception:
@@ -758,15 +801,36 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
         logger.info("Worker loop exiting for user %s", user_id)
 
 # ---------------------------
-# Scheduler
+# Scheduler for hourly stats and suspension lifting
 # ---------------------------
 
-scheduler = BackgroundScheduler()
+def fetch_display_username(user_id: int):
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        c.execute("SELECT username FROM allowed_users WHERE user_id = ?", (user_id,))
+        r = c.fetchone()
+        if r and r[0]:
+            return r[0]
+        c.execute("SELECT username FROM split_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
+        r2 = c.fetchone()
+        if r2 and r2[0]:
+            return r2[0]
+    return ""
+
 def compute_last_hour_stats():
     cutoff = datetime.utcnow() - timedelta(hours=1)
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
-        c.execute("SELECT user_id, username, SUM(words) as s FROM split_logs WHERE created_at >= ? GROUP BY user_id ORDER BY s DESC", (cutoff.strftime("%Y-%m-%d %H:%M:%S"),))
+        c.execute("""
+            SELECT user_id, 
+                   COALESCE(username, (
+                       SELECT username FROM allowed_users WHERE allowed_users.user_id = split_logs.user_id
+                   ), '') as uname,
+                   SUM(words) as s 
+            FROM split_logs 
+            WHERE created_at >= ? 
+            GROUP BY user_id 
+            ORDER BY s DESC""", (cutoff.strftime("%Y-%m-%d %H:%M:%S"),))
         rows = c.fetchall()
     return rows
 
@@ -783,11 +847,9 @@ def send_hourly_owner_stats():
     lines = []
     for r in rows:
         uid = r[0]
-        uname = r[1] or ""
+        uname = r[1] or fetch_display_username(uid)
         w = int(r[2] or 0)
-        # Format: User (Username) - Count
-        name_display = f" ({uname})" if uname else ""
-        part = f"{uid}{name_display} - {w} words"
+        part = f"{uid} ({uname}) - {w} words"
         lines.append(part)
     body = "⏰ Hourly Report (Last 1h): 📝\n" + "\n".join(lines)
     for oid in OWNER_IDS:
@@ -811,16 +873,12 @@ def check_and_lift():
         except Exception:
             logger.exception("suspend parse error for %s", r)
 
+scheduler = BackgroundScheduler()
 scheduler.add_job(send_hourly_owner_stats, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=10), timezone='UTC')
 scheduler.add_job(check_and_lift, "interval", minutes=1, next_run_time=datetime.utcnow() + timedelta(seconds=15), timezone='UTC')
-# Scheduled maintenance times (UTC)
-scheduler.add_job(start_maintenance, 'cron', hour=2, minute=0, timezone='UTC') # 3 AM WAT
-scheduler.add_job(end_maintenance, 'cron', hour=3, minute=0, timezone='UTC')   # 4 AM WAT
+scheduler.add_job(start_maintenance, 'cron', hour=2, minute=0, timezone='UTC')
+scheduler.add_job(end_maintenance, 'cron', hour=3, minute=0, timezone='UTC')
 scheduler.start()
-
-# ---------------------------
-# Webhook and Commands
-# ---------------------------
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -835,10 +893,6 @@ def webhook():
             uid = user.get("id")
             username = user.get("username") or (user.get("first_name") or "")
             text = msg.get("text") or ""
-            
-            # Auto-update user info
-            update_user_info(uid, username)
-            
             if text.startswith("/"):
                 parts = text.split(None, 1)
                 cmd = parts[0].split("@")[0].lower()
@@ -857,6 +911,12 @@ def root():
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     return jsonify({"ok": True, "ts": now_ts()}), 200
+
+def get_queued_for_user(user_id: int) -> int:
+    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,))
+        return c.fetchone()[0]
 
 def handle_command(user_id: int, username: str, command: str, args: str):
     if command == "/start":
@@ -995,7 +1055,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         parts = re.split(r"[,\s]+", args.strip())
         added, already, invalid = [], [], []
         for p in parts:
-            if not p: continue
+            if not p:
+                continue
             try:
                 tid = int(p)
             except Exception:
@@ -1021,24 +1082,25 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, "Result: " + ("; ".join(parts_msgs) if parts_msgs else "No changes"))
         return jsonify({"ok": True})
 
+    # USERNAME EVERYWHERE IN /listusers
     if command == "/listusers":
         if not is_admin(user_id):
             send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
         with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
             c = conn.cursor()
-            c.execute("SELECT user_id, username, is_admin, added_at FROM allowed_users ORDER BY added_at DESC")
+            c.execute("SELECT user_id, is_admin, added_at FROM allowed_users ORDER BY added_at DESC")
             rows = c.fetchall()
         lines = []
         for r in rows:
-            uid, uname, isadm, added_at_utc = r
+            uid, isadm, added_at_utc = r
+            uname = fetch_display_username(uid)
             added_at_wat = utc_to_wat_ts(added_at_utc)
-            # Format: User (Username) - Role - added=...
-            name_display = f" ({uname})" if uname else ""
-            lines.append(f"👥 {uid}{name_display} - {'👑 Admin' if isadm else '👤 User'} - added={added_at_wat}")
+            lines.append(f"👥 {uid} ({uname or 'no-name'}) - {'👑 Admin' if isadm else '👤 User'} - added={added_at_wat}")
         send_message(user_id, "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)"))
         return jsonify({"ok": True})
 
+    # USERNAME EVERYWHERE IN /botinfo USER STATS & ACTIVE
     if command == "/botinfo":
         if user_id not in OWNER_IDS:
             send_message(user_id, "👑 Owner only.")
@@ -1061,14 +1123,17 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         lines_active = []
         for r in active_rows:
             uid, uname, rem, ac = r
+            if not uname:
+                uname = fetch_display_username(uid)
             name = f" ({uname})" if uname else ""
             queued_for_user = queued_counts.get(uid, 0)
             lines_active.append(f"⚙️ {uid}{name} - {int(rem)} remaining - {int(ac)} active - {queued_for_user} queued")
         lines_stats = []
         for r in stats_rows:
             uid, uname, s = r
-            name = f" ({uname})" if uname else ""
-            lines_stats.append(f"📈 {uid}{name} - {int(s)} words")
+            if not uname:
+                uname = fetch_display_username(uid)
+            lines_stats.append(f"📈 {uid} ({uname}) - {int(s)} words")
         maintenance_status = "ON 🚧" if is_maintenance_time() else "OFF ✅"
         body = (
             "🟢 Bot Status\n"
@@ -1109,40 +1174,36 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             notify_owners("Broadcast failures: " + ", ".join(f"{x[0]}({x[1]})" for x in failed))
         return jsonify({"ok": True})
 
+    # /suspend usage example/format
     if command == "/suspend":
         if not is_admin(user_id):
             send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
-        # Check if args exist and start with a number (likely ID)
-        if not args or not args.strip():
-            msg = (
-                "ℹ️ **Usage Examples:**\n\n"
-                "`/suspend 12345678 30s`\n"
-                "_(Suspends user 12345678 for 30 seconds)_\n\n"
-                "`/suspend 9876543 5m spamming`\n"
-                "_(Suspends user 9876543 for 5 minutes with reason 'spamming')_\n\n"
-                "`/suspend 11223344 2h`\n"
-                "_(Suspends user 11223344 for 2 hours)_"
-            )
+        if not args:
+            demo_id = user_id
+            msg = ("Usage:\n"
+                   "  /suspend <user_id> <duration>\n\n"
+                   "Examples:\n"
+                   f"  /suspend {demo_id} 30s\n"
+                   f"  /suspend {demo_id} 5m\n"
+                   f"  /suspend {demo_id} 2h\n"
+                   f"  /suspend {demo_id} 1d")
             send_message(user_id, msg)
             return jsonify({"ok": True})
-        
         parts = args.split(None, 2)
         try:
             target = int(parts[0])
-        except ValueError:
-            send_message(user_id, "❌ Invalid user ID. First argument must be a number.\nExample: `/suspend 12345678 10m`")
+        except Exception:
+            send_message(user_id, "❌ Invalid user id.\nExample: /suspend 12345678 5m Spamming")
             return jsonify({"ok": True})
-            
         if len(parts) < 2:
-            send_message(user_id, "❌ Missing duration.\nExample: `/suspend 12345678 5m`")
+            send_message(user_id, "❌ Missing duration.\nExample: /suspend 12345678 5m Spamming")
             return jsonify({"ok": True})
-            
         dur = parts[1]
         reason = parts[2] if len(parts) > 2 else ""
         m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
         if not m:
-            send_message(user_id, "❌ Invalid duration format.\nUse 30s, 5m, 3h, 2d.")
+            send_message(user_id, "❌ Invalid duration format.\nUse 30s, 5m, 3h, 2d.\nExample: /suspend 12345678 5m")
             return jsonify({"ok": True})
         val, unit = int(m.group(1)), (m.group(2) or "s")
         mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
@@ -1151,22 +1212,23 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, f"✅ Suspended {target} for {val}{unit}.")
         return jsonify({"ok": True})
 
+    # /unsuspend usage example/format
     if command == "/unsuspend":
         if not is_admin(user_id):
             send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
-        if not args or not args.strip():
-            msg = (
-                "ℹ️ **Usage Example:**\n\n"
-                "`/unsuspend 12345678`\n"
-                "_(Lifts the suspension for user 12345678)_"
-            )
+        if not args:
+            demo_id = user_id
+            msg = ("Usage:\n"
+                   "  /unsuspend <user_id>\n\n"
+                   "Example:\n"
+                   f"  /unsuspend {demo_id}")
             send_message(user_id, msg)
             return jsonify({"ok": True})
         try:
             target = int(args.split()[0])
-        except ValueError:
-            send_message(user_id, "❌ Invalid user ID.\nExample: `/unsuspend 12345678`")
+        except Exception:
+            send_message(user_id, "❌ Invalid user id.\nExample: /unsuspend 12345678")
             return jsonify({"ok": True})
         ok = unsuspend_user(target)
         if ok:
@@ -1242,7 +1304,6 @@ def handle_user_text(user_id: int, username: str, text: str):
         send_message(user_id, f"🚀 Task accepted — will split *{res['total_words']}* words. ✨")
     return jsonify({"ok": True})
 
-# Webhook setup helper
 def set_webhook():
     if not TELEGRAM_API or not WEBHOOK_URL:
         logger.info("Webhook not configured.")
