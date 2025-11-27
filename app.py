@@ -1122,7 +1122,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, f"✅ User {target} unsuspended.")
         else:
             send_message(user_id, f"ℹ️ User {target} is not suspended.")
-        return jsonify({"ok": True}")
+        return jsonify({"ok": True})
 
     send_message(user_id, "🤔 Unknown command.")
     return jsonify({"ok": True})
