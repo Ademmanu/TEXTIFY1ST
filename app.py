@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-WordSplitter Telegram Bot - optimized for long-running, moderate-concurrency hosting
+WordSplitter Telegram Bot - optimized and with robust failure handling
 
-Major runtime improvements:
-- Single shared SQLite connection (check_same_thread=False) with WAL mode and tuned pragmas.
-- DB access serialized via a lock to avoid frequent open/close and reduce sqlite "database is locked" errors.
-- Active sender concurrency capped via a semaphore (MAX_CONCURRENT_WORKERS, default 25).
-- Token bucket rewritten with Condition to avoid busy-wait CPU usage.
-- Requests Session pool increased for higher concurrency.
-- Periodic cleanup job to prune old split_logs and sent_messages to avoid unbounded DB growth.
-- Graceful shutdown handlers to stop scheduler and user workers on SIGTERM/SIGINT.
-- Maintains original behavior and message contents where possible.
+This updated version implements:
+- Distinction between transient and permanent Telegram send errors.
+- Retries with exponential backoff for transient/network errors, and 429 retry_after handling.
+- Permanent failures (e.g., 400/403 chat not found / bot blocked) lead to a single owner notification
+  and suspension/cancellation of the user's tasks (so we stop retrying).
+- send_failures table schema extended with 'notified', 'last_error_code', 'last_error_desc'.
+- Migration logic to add new columns if the DB was created with an older schema.
+- Owner notifications are sent only once per escalation (via 'notified').
+- Successful sends reset the failure counters/flags.
+- Existing optimizations retained (shared DB connection, semaphore for concurrency, token bucket).
 """
 
 import os
@@ -21,6 +22,7 @@ import threading
 import logging
 import re
 import signal
+import math
 from datetime import datetime, timedelta
 from typing import List, Dict
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -43,6 +45,8 @@ MAX_MSG_PER_SECOND = float(os.environ.get("MAX_MSG_PER_SECOND", "50"))
 REQUESTS_TIMEOUT = float(os.environ.get("REQUESTS_TIMEOUT", "10"))
 MAX_CONCURRENT_WORKERS = int(os.environ.get("MAX_CONCURRENT_WORKERS", "25"))
 LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "30"))
+FAILURE_NOTIFY_THRESHOLD = int(os.environ.get("FAILURE_NOTIFY_THRESHOLD", "6"))
+PERMANENT_SUSPEND_DAYS = int(os.environ.get("PERMANENT_SUSPEND_DAYS", "365"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else None
 
@@ -85,21 +89,12 @@ def utc_to_wat_ts(utc_ts: str) -> str:
     except Exception:
         return f"{utc_ts} (UTC error)"
 
-# Helper formatting functions added per request
 def at_username(u: str) -> str:
-    """
-    Return username WITHOUT the leading '@'. Usernames are displayed plain
-    (no @ prefix) and are NOT clickable (no mention entities).
-    """
     if not u:
         return ""
     return u.lstrip("@")
 
 def label_for_self(viewer_id: int, username: str) -> str:
-    """
-    Return a short label when speaking to the user about themselves.
-    Regular users do NOT see numeric IDs. Owners may see their own ID.
-    """
     if username:
         if viewer_id in OWNER_IDS:
             return f"{at_username(username)} (ID: {viewer_id})"
@@ -107,15 +102,10 @@ def label_for_self(viewer_id: int, username: str) -> str:
     return f"(ID: {viewer_id})" if viewer_id in OWNER_IDS else ""
 
 def label_for_owner_view(target_id: int, target_username: str) -> str:
-    """
-    When showing a user in owner-facing messages, include username (no '@') if available,
-    otherwise show numeric id. Always include numeric id for clarity to owners.
-    """
     if target_username:
         return f"{at_username(target_username)} (ID: {target_id})"
     return str(target_id)
 
-# Replace plain "Owner" mentions with Owner (@justmemmy) in messages.
 OWNER_TAG = "Owner (@justmemmy)"
 
 _db_lock = threading.Lock()
@@ -131,21 +121,14 @@ def _ensure_db_parent(dirpath: str):
 def init_db():
     """
     Initialize the DB and create a single global connection with tuned pragmas.
+    Also creates tables and runs lightweight schema migration for added columns.
     """
     global DB_PATH, GLOBAL_DB_CONN
     parent = os.path.dirname(os.path.abspath(DB_PATH))
     if parent:
         _ensure_db_parent(parent)
 
-    try:
-        # Create connection with shared threading allowed.
-        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
-        conn.execute("PRAGMA cache_size=-2000;")  # ~2MB cache
-        conn.execute("PRAGMA foreign_keys=ON;")
-        conn.execute("PRAGMA busy_timeout=30000;")  # 30s busy timeout
+    def _create_schema(conn):
         c = conn.cursor()
         c.execute("""
         CREATE TABLE IF NOT EXISTS allowed_users (
@@ -190,13 +173,27 @@ def init_db():
             reason TEXT,
             added_at TEXT
         )""")
+        # New schema: send_failures with notified and last error details
         c.execute("""
         CREATE TABLE IF NOT EXISTS send_failures (
             user_id INTEGER PRIMARY KEY,
             failures INTEGER,
-            last_failure_at TEXT
+            last_failure_at TEXT,
+            notified INTEGER DEFAULT 0,
+            last_error_code INTEGER,
+            last_error_desc TEXT
         )""")
         conn.commit()
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA cache_size=-2000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        _create_schema(conn)
         GLOBAL_DB_CONN = conn
         logger.info("DB initialized at %s", DB_PATH)
     except Exception:
@@ -210,66 +207,46 @@ def init_db():
             conn.execute("PRAGMA cache_size=-2000;")
             conn.execute("PRAGMA foreign_keys=ON;")
             conn.execute("PRAGMA busy_timeout=30000;")
-            c = conn.cursor()
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS allowed_users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                added_at TEXT
-            )""")
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                text TEXT,
-                words_json TEXT,
-                total_words INTEGER,
-                sent_count INTEGER DEFAULT 0,
-                status TEXT,
-                created_at TEXT,
-                started_at TEXT,
-                finished_at TEXT
-            )""")
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS split_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                words INTEGER,
-                created_at TEXT
-            )""")
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS sent_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                message_id INTEGER,
-                sent_at TEXT,
-                deleted INTEGER DEFAULT 0
-            )""")
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS suspended_users (
-                user_id INTEGER PRIMARY KEY,
-                suspended_until TEXT,
-                reason TEXT,
-                added_at TEXT
-            )""")
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS send_failures (
-                user_id INTEGER PRIMARY KEY,
-                failures INTEGER,
-                last_failure_at TEXT
-            )""")
-            conn.commit()
+            _create_schema(conn)
             GLOBAL_DB_CONN = conn
             logger.info("In-memory DB initialized")
         except Exception:
             GLOBAL_DB_CONN = None
             logger.exception("Failed to initialize in-memory DB; DB operations may fail")
 
-init_db()
+def ensure_send_failures_columns():
+    """
+    Ensure migration: if older DB lacks columns (notified, last_error_code, last_error_desc),
+    try to add them via ALTER TABLE (best effort).
+    """
+    try:
+        with _db_lock:
+            c = GLOBAL_DB_CONN.cursor()
+            c.execute("PRAGMA table_info(send_failures)")
+            cols = [r[1] for r in c.fetchall()]
+            to_add = []
+            if "notified" not in cols:
+                to_add.append("ALTER TABLE send_failures ADD COLUMN notified INTEGER DEFAULT 0")
+            if "last_error_code" not in cols:
+                to_add.append("ALTER TABLE send_failures ADD COLUMN last_error_code INTEGER")
+            if "last_error_desc" not in cols:
+                to_add.append("ALTER TABLE send_failures ADD COLUMN last_error_desc TEXT")
+            for stmt in to_add:
+                try:
+                    c.execute(stmt)
+                except Exception:
+                    # Ignore - maybe older sqlite can't alter; it's best-effort
+                    logger.debug("Migration statement failed: %s", stmt)
+            GLOBAL_DB_CONN.commit()
+    except Exception:
+        logger.exception("ensure_send_failures_columns failed")
 
-# Ensure owners auto-added as allowed (never suspended)
+# Initialize DB and run migration check
+init_db()
+if GLOBAL_DB_CONN:
+    ensure_send_failures_columns()
+
+# Ensure owners auto-added as allowed
 for oid in OWNER_IDS:
     try:
         with _db_lock:
@@ -282,7 +259,7 @@ for oid in OWNER_IDS:
     except Exception:
         logger.exception("Error ensuring owner in allowed_users")
 
-# Ensure all ALLOWED_USERS auto-added as allowed at startup (skip owners)
+# Ensure provided ALLOWED_USERS auto-added
 for uid in ALLOWED_USERS:
     if uid in OWNER_IDS:
         continue
@@ -305,7 +282,7 @@ for uid in ALLOWED_USERS:
     except Exception:
         logger.exception("Auto-add allowed user error")
 
-# Token bucket reworked using Condition to avoid busy-wait
+# Token bucket using Condition to avoid busy-wait loops
 class TokenBucket:
     def __init__(self, rate_per_sec: float):
         self.capacity = max(1.0, rate_per_sec)
@@ -330,7 +307,6 @@ class TokenBucket:
                 remaining = end - time.monotonic()
                 if remaining <= 0:
                     return False
-                # Wait a short time or until tokens may have been refilled
                 wait_time = min(remaining, max(0.01, (1.0 / max(1.0, self.rate))))
                 self.cond.wait(timeout=wait_time)
 
@@ -339,7 +315,6 @@ class TokenBucket:
             self.cond.notify_all()
 
 _token_bucket = TokenBucket(MAX_MSG_PER_SECOND)
-
 def acquire_token(timeout=10.0):
     return _token_bucket.acquire(timeout=timeout)
 
@@ -350,20 +325,11 @@ def parse_telegram_json(resp):
         return None
 
 def _utf16_len(s: str) -> int:
-    """
-    Return length in UTF-16 code units for a Python string.
-    Telegram requires offsets/lengths in UTF-16 code units.
-    We use utf-16-le encoding and divide bytes by 2 to get code units.
-    """
     if not s:
         return 0
     return len(s.encode("utf-16-le")) // 2
 
 def _build_entities_for_text(text: str):
-    """
-    Build a list of Telegram message entities for:
-    - plain numeric tokens -> type "code" (monospace, copyable)
-    """
     if not text:
         return None
     entities = []
@@ -375,40 +341,99 @@ def _build_entities_for_text(text: str):
         entities.append({"type": "code", "offset": utf16_offset, "length": utf16_length})
     return entities if entities else None
 
-def increment_failure(user_id: int):
+# Failure handling helpers
+
+def is_permanent_telegram_error(code: int, description: str = "") -> bool:
+    """
+    Consider 400 and 403 errors as permanent/unrecoverable for our bot (e.g., chat not found or bot blocked).
+    Some 400 codes might be transient in rare cases, but in practice 400/403 for sendMessage indicates permanent.
+    """
+    try:
+        if code in (400, 403):
+            return True
+    except Exception:
+        pass
+    # Additional heuristic checks on description
+    if description:
+        desc = description.lower()
+        if "bot was blocked" in desc or "chat not found" in desc or "user is deactivated" in desc or "forbidden" in desc:
+            return True
+    return False
+
+def mark_user_permanently_unreachable(user_id: int, error_code: int = None, description: str = ""):
+    """
+    Record a permanent failure and suspend the user for a long duration so we stop retrying.
+    Notify owners once. Owners are never suspended.
+    """
     try:
         if user_id in OWNER_IDS:
-            logger.warning("Send failure for owner %s; recording but not notifying owners to avoid recursion/loops.", user_id)
+            # For owners, just log but don't suspend
             with _db_lock:
                 c = GLOBAL_DB_CONN.cursor()
-                c.execute("SELECT failures FROM send_failures WHERE user_id = ?", (user_id,))
-                row = c.fetchone()
-                if not row:
-                    c.execute("INSERT INTO send_failures (user_id, failures, last_failure_at) VALUES (?, ?, ?)",
-                              (user_id, 1, now_ts()))
-                else:
-                    failures = int(row[0] or 0) + 1
-                    c.execute("UPDATE send_failures SET failures = ?, last_failure_at = ? WHERE user_id = ?",
-                              (failures, now_ts(), user_id))
+                c.execute("INSERT OR REPLACE INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (?, ?, ?, ?, ?, ?)",
+                          (user_id, FAILURE_NOTIFY_THRESHOLD, now_ts(), 1, error_code, description))
                 GLOBAL_DB_CONN.commit()
+            notify_owners(f"⚠️ Repeated send failures for owner {user_id}. Please investigate. Error: {error_code} {description}")
             return
 
+        # Save into send_failures and set notified flag
         with _db_lock:
             c = GLOBAL_DB_CONN.cursor()
-            c.execute("SELECT failures FROM send_failures WHERE user_id = ?", (user_id,))
+            c.execute("INSERT OR REPLACE INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (?, ?, ?, ?, ?, ?)",
+                      (user_id, 999, now_ts(), 1, error_code, description))
+            GLOBAL_DB_CONN.commit()
+
+        # Cancel tasks and suspend the user for PERMANENT_SUSPEND_DAYS
+        cancel_active_task_for_user(user_id)
+        suspend_user(user_id, PERMANENT_SUSPEND_DAYS * 24 * 3600, f"Permanent send failure: {error_code} {description}")
+
+        # Notify owners once
+        notify_owners(f"⚠️ Repeated send failures for {user_id} ({error_code}). Stopping their tasks. 🛑 Error: {description}")
+    except Exception:
+        logger.exception("mark_user_permanently_unreachable failed for %s", user_id)
+
+def record_failure(user_id: int, inc: int = 1, error_code: int = None, description: str = "", is_permanent: bool = False):
+    """
+    Increment or set failure data in DB; if threshold reached, notify owners once and optionally
+    escalate to permanent handling.
+    """
+    try:
+        with _db_lock:
+            c = GLOBAL_DB_CONN.cursor()
+            c.execute("SELECT failures, notified FROM send_failures WHERE user_id = ?", (user_id,))
             row = c.fetchone()
             if not row:
-                c.execute("INSERT INTO send_failures (user_id, failures, last_failure_at) VALUES (?, ?, ?)",(user_id, 1, now_ts()))
-                failures = 1
+                failures = inc
+                notified = 0
+                c.execute("INSERT INTO send_failures (user_id, failures, last_failure_at, notified, last_error_code, last_error_desc) VALUES (?, ?, ?, ?, ?, ?)",
+                          (user_id, failures, now_ts(), 0, error_code, description))
             else:
-                failures = int(row[0] or 0) + 1
-                c.execute("UPDATE send_failures SET failures = ?, last_failure_at = ? WHERE user_id = ?",(failures, now_ts(), user_id))
+                failures = int(row[0] or 0) + inc
+                notified = int(row[1] or 0)
+                c.execute("UPDATE send_failures SET failures = ?, last_failure_at = ?, last_error_code = ?, last_error_desc = ? WHERE user_id = ?",
+                          (failures, now_ts(), error_code, description, user_id))
             GLOBAL_DB_CONN.commit()
-        if failures >= 6:
+
+        # If it's marked permanent by caller OR heuristics determine it's permanent, escalate now:
+        if is_permanent or is_permanent_telegram_error(error_code or 0, description):
+            # Mark permanent and suspend/cancel
+            mark_user_permanently_unreachable(user_id, error_code, description)
+            return
+
+        # Notify owners only once when threshold reached
+        if failures >= FAILURE_NOTIFY_THRESHOLD and notified == 0:
+            try:
+                with _db_lock:
+                    c = GLOBAL_DB_CONN.cursor()
+                    c.execute("UPDATE send_failures SET notified = 1 WHERE user_id = ?", (user_id,))
+                    GLOBAL_DB_CONN.commit()
+            except Exception:
+                logger.exception("Failed to set notified flag for %s", user_id)
             notify_owners(f"⚠️ Repeated send failures for {user_id} ({failures}). Stopping their tasks. 🛑")
+            # Take a cautious step: cancel their active tasks to reduce wasted sends (but don't suspend permanently)
             cancel_active_task_for_user(user_id)
     except Exception:
-        logger.exception("increment_failure error")
+        logger.exception("record_failure error for %s", user_id)
 
 def reset_failures(user_id: int):
     try:
@@ -417,53 +442,108 @@ def reset_failures(user_id: int):
             c.execute("DELETE FROM send_failures WHERE user_id = ?", (user_id,))
             GLOBAL_DB_CONN.commit()
     except Exception:
-        pass
+        logger.exception("reset_failures failed for %s", user_id)
 
 def send_message(chat_id: int, text: str):
     """
     Send plain text (no parse_mode). Numeric IDs inside the text are sent
     as monospace (code) via the 'entities' parameter so they are copyable.
-    Usernames are plain text without leading '@' and not clickable.
+    Includes retry/backoff for transient errors and 429 handling.
     """
     if not TELEGRAM_API:
         logger.error("No TELEGRAM_TOKEN; cannot send message.")
         return None
-    acquired = acquire_token(timeout=5.0)
-    if not acquired:
-        logger.warning("Token acquire timed out; dropping send to %s", chat_id)
-        increment_failure(chat_id)
-        return None
+
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     entities = _build_entities_for_text(text)
     if entities:
         payload["entities"] = entities
-    try:
-        resp = _session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUESTS_TIMEOUT)
-    except Exception:
-        logger.exception("Network send error")
-        increment_failure(chat_id)
-        return None
-    data = parse_telegram_json(resp)
-    if data and data.get("ok"):
-        try:
-            mid = data["result"].get("message_id")
-            if mid:
-                with _db_lock:
-                    c = GLOBAL_DB_CONN.cursor()
-                    c.execute("INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (?, ?, ?, 0)",(chat_id, mid, now_ts()))
-                    GLOBAL_DB_CONN.commit()
-        except Exception:
-            logger.exception("record sent message failed")
-        reset_failures(chat_id)
-        return data["result"]
-    else:
-        increment_failure(chat_id)
+
+    # Acquire token before attempting send
+    if not acquire_token(timeout=5.0):
+        logger.warning("Token acquire timed out; dropping send to %s", chat_id)
+        record_failure(chat_id, inc=1, description="token_acquire_timeout")
         return None
 
+    # We'll attempt a small number of retries for transient/network errors
+    max_attempts = 3
+    attempt = 0
+    backoff_base = 0.5
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            resp = _session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUESTS_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            logger.warning("Network send error to %s (attempt %s): %s", chat_id, attempt, e)
+            # transient network error: retry with backoff
+            if attempt >= max_attempts:
+                record_failure(chat_id, inc=1, description=str(e))
+                return None
+            time.sleep(backoff_base * (2 ** (attempt - 1)))
+            continue
+
+        data = parse_telegram_json(resp)
+        if not isinstance(data, dict):
+            # unexpected response; treat as transient
+            logger.warning("Unexpected non-json response for sendMessage to %s", chat_id)
+            if attempt >= max_attempts:
+                record_failure(chat_id, inc=1, description="non_json_response")
+                return None
+            time.sleep(backoff_base * (2 ** (attempt - 1)))
+            continue
+
+        if data.get("ok"):
+            # Success: record message and reset any existing failure state for this user
+            try:
+                mid = data["result"].get("message_id")
+                if mid:
+                    with _db_lock:
+                        c = GLOBAL_DB_CONN.cursor()
+                        c.execute("INSERT INTO sent_messages (chat_id, message_id, sent_at, deleted) VALUES (?, ?, ?, 0)",(chat_id, mid, now_ts()))
+                        GLOBAL_DB_CONN.commit()
+            except Exception:
+                logger.exception("record sent message failed")
+            # Reset failures since send succeeded
+            reset_failures(chat_id)
+            return data["result"]
+
+        # Not ok -> inspect error details
+        error_code = data.get("error_code")
+        description = data.get("description", "")
+        params = data.get("parameters") or {}
+        # If rate limited and retry_after present, sleep then retry
+        if error_code == 429:
+            retry_after = params.get("retry_after")
+            if retry_after is None:
+                # If no retry_after, be conservative and wait a short time
+                retry_after = 1
+            try:
+                retry_after = int(retry_after)
+            except Exception:
+                retry_after = 1
+            logger.info("Rate limited for %s: retry_after=%s", chat_id, retry_after)
+            # Wait and retry (counts as transient)
+            time.sleep(max(0.5, retry_after))
+            # on next iteration we will try again
+            if attempt >= max_attempts:
+                record_failure(chat_id, inc=1, error_code=error_code, description=description)
+                return None
+            continue
+
+        # Permanent errors (400/403 etc.) - escalate immediately
+        if is_permanent_telegram_error(error_code or 0, description):
+            logger.info("Permanent error for %s: %s %s", chat_id, error_code, description)
+            record_failure(chat_id, inc=1, error_code=error_code, description=description, is_permanent=True)
+            return None
+
+        # Other errors - treat as transient, retry a few times
+        logger.warning("Transient/send error for %s: %s %s", chat_id, error_code, description)
+        if attempt >= max_attempts:
+            record_failure(chat_id, inc=1, error_code=error_code, description=description)
+            return None
+        time.sleep(backoff_base * (2 ** (attempt - 1)))
+
 def broadcast_send_raw(chat_id: int, text: str):
-    """
-    Send a plain broadcast message; numeric IDs will be marked as code entities.
-    """
     if not TELEGRAM_API:
         return False, "no_token"
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
@@ -490,6 +570,11 @@ def broadcast_send_raw(chat_id: int, text: str):
         return True, "ok"
     reason = data.get("description") if isinstance(data, dict) else "error"
     logger.info("Broadcast failed to %s: %s", chat_id, reason)
+    # Record a failure for non-ok broadcast attempts
+    try:
+        record_failure(chat_id, inc=1, error_code=(data.get("error_code") if isinstance(data, dict) else None), description=reason)
+    except Exception:
+        pass
     return False, reason
 
 def broadcast_to_all_allowed(text: str):
@@ -579,7 +664,6 @@ def record_split_log(user_id: int, username: str, count: int = 1):
         logger.exception("record_split_log error")
 
 def is_allowed(user_id: int) -> bool:
-    # Owners are always allowed
     if user_id in OWNER_IDS:
         return True
     with _db_lock:
@@ -699,9 +783,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
     logger.info("Worker loop starting for user %s", user_id)
     acquired_semaphore = False
     try:
-        # Cache uname for stat and log outside the main loop
         uname_for_stat = fetch_display_username(user_id) or str(user_id)
-
         while not stop_event.is_set():
             if is_suspended(user_id):
                 cancel_active_task_for_user(user_id)
@@ -716,7 +798,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
 
             task = get_next_task_for_user(user_id)
             if not task:
-                # Wait for a new task/wake up
                 wake_event.wait(timeout=1.0)
                 wake_event.clear()
                 continue
@@ -733,14 +814,12 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             if not sent_info or sent_info[1] == "cancelled":
                 continue
 
-            # Acquire semaphore to limit the number of concurrent active senders
-            # Block until available, but allow stop_event to wake via wake_event
+            # Acquire concurrency semaphore
             while not stop_event.is_set():
                 acquired = _active_workers_semaphore.acquire(timeout=1.0)
                 if acquired:
                     acquired_semaphore = True
                     break
-                # If not acquired, check if the task got cancelled
                 with _db_lock:
                     c = GLOBAL_DB_CONN.cursor()
                     c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
@@ -748,7 +827,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 if not row_check or row_check[0] == "cancelled":
                     break
 
-            # Re-check status after acquiring semaphore
             with _db_lock:
                 c = GLOBAL_DB_CONN.cursor()
                 c.execute("SELECT sent_count, status FROM tasks WHERE id = ?", (task_id,))
@@ -762,7 +840,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             sent = int(sent_info[0] or 0)
             set_task_status(task_id, "running")
 
-            # Dynamic interval
             interval = 0.5 if total <= 150 else (0.6 if total <= 300 else 0.7)
             est_seconds = int((total - sent) * interval)
             est_str = str(timedelta(seconds=est_seconds))
@@ -790,7 +867,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                         send_message(user_id, f"⏸️ Task paused…")
                     except Exception:
                         pass
-                    # Pause loop
                     while True:
                         wake_event.wait(timeout=0.7)
                         wake_event.clear()
@@ -816,7 +892,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                             except Exception: pass
                         break
 
-                # --- Send Word and Log ---
                 try:
                     send_message(user_id, words[i])
                     record_split_log(user_id, uname_for_stat, 1)
@@ -825,7 +900,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
 
                 i += 1
 
-                # update sent_count
                 try:
                     with _db_lock:
                         c = GLOBAL_DB_CONN.cursor()
@@ -834,7 +908,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 except Exception:
                     logger.exception("Failed to update sent_count for task %s", task_id)
 
-                # Check wake_event quickly
                 if wake_event.is_set():
                     wake_event.clear()
                     continue
@@ -843,14 +916,12 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 elapsed = now - last_send_time
                 remaining_time = interval - elapsed
                 if remaining_time > 0:
-                    # Sleep the precise remaining time
                     time.sleep(remaining_time)
                 last_send_time = time.monotonic()
 
                 if is_suspended(user_id):
                     break
 
-            # Finalize task
             with _db_lock:
                 c = GLOBAL_DB_CONN.cursor()
                 c.execute("SELECT status, sent_count FROM tasks WHERE id = ?", (task_id,))
@@ -869,7 +940,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 except Exception:
                     pass
 
-            # Release semaphore slot (no matter why loop ended)
             if acquired_semaphore:
                 try:
                     _active_workers_semaphore.release()
@@ -890,7 +960,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
         logger.info("Worker loop exiting for user %s", user_id)
 
 def fetch_display_username(user_id: int):
-    # Always show most recent username for user if available, from logs or allowed_users.
     with _db_lock:
         c = GLOBAL_DB_CONN.cursor()
         c.execute("SELECT username FROM split_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
@@ -967,10 +1036,6 @@ def check_and_lift():
             logger.exception("suspend parse error for %s", r)
 
 def prune_old_logs():
-    """
-    Periodic job to prune split_logs and sent_messages older than LOG_RETENTION_DAYS.
-    Keeps DB small for long-running unlimited usage.
-    """
     try:
         cutoff = (datetime.utcnow() - timedelta(days=LOG_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
         with _db_lock:
@@ -988,18 +1053,15 @@ def prune_old_logs():
 scheduler = BackgroundScheduler()
 scheduler.add_job(send_hourly_owner_stats, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=10), timezone='UTC')
 scheduler.add_job(check_and_lift, "interval", minutes=1, next_run_time=datetime.utcnow() + timedelta(seconds=15), timezone='UTC')
-# Daily cleanup at a gentle time interval
 scheduler.add_job(prune_old_logs, "interval", hours=24, next_run_time=datetime.utcnow() + timedelta(seconds=30), timezone='UTC')
 scheduler.start()
 
-# Graceful shutdown to stop scheduler and workers nicely
 def _graceful_shutdown(signum, frame):
     logger.info("Graceful shutdown signal received (%s). Stopping scheduler and workers...", signum)
     try:
         scheduler.shutdown(wait=False)
     except Exception:
         pass
-    # Stop user workers
     with _user_workers_lock:
         keys = list(_user_workers.keys())
     for k in keys:
@@ -1010,7 +1072,6 @@ def _graceful_shutdown(signum, frame):
     except Exception:
         pass
     logger.info("Shutdown completed. Exiting.")
-    # If running under Flask dev server, os._exit to ensure process ends
     try:
         import os
         os._exit(0)
@@ -1034,7 +1095,7 @@ def webhook():
             username = user.get("username") or (user.get("first_name") or "")
             text = msg.get("text") or ""
 
-            # Only update username for existing/allowed users.
+            # Update username only for existing/allowed users
             try:
                 with _db_lock:
                     c = GLOBAL_DB_CONN.cursor()
@@ -1074,7 +1135,6 @@ def get_user_task_counts(user_id: int):
 def handle_command(user_id: int, username: str, command: str, args: str):
     def is_owner(u): return u in OWNER_IDS
 
-    # Ensure /start and /about are always functional for everyone
     if command == "/start":
         who = label_for_self(user_id, username) or "there"
         msg = (
@@ -1392,7 +1452,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     return jsonify({"ok": True})
 
 def handle_user_text(user_id: int, username: str, text: str):
-    # Owners are always allowed; regular users must be in allowed_users
     if user_id not in OWNER_IDS and not is_allowed(user_id):
         send_message(user_id, f"🚫 Sorry, you are not allowed. {OWNER_TAG} notified.\nYour ID: {user_id}")
         notify_owners(f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
