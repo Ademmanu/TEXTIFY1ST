@@ -12,7 +12,7 @@ This updated version implements:
 - Owner notifications are sent only once per escalation (via 'notified').
 - Successful sends reset the failure counters/flags.
 - Existing optimizations retained (shared DB connection, semaphore for concurrency, token bucket).
-- Added /ownersets command with inline buttons for all owner operations
+- All owner commands grouped under /ownersets with inline buttons for intuitive navigation
 """
 
 import os
@@ -23,7 +23,6 @@ import threading
 import logging
 import re
 import signal
-import math
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -178,7 +177,6 @@ def init_db():
             reason TEXT,
             added_at TEXT
         )""")
-        # New schema: send_failures with notified and last error details
         c.execute("""
         CREATE TABLE IF NOT EXISTS send_failures (
             user_id INTEGER PRIMARY KEY,
@@ -188,7 +186,6 @@ def init_db():
             last_error_code INTEGER,
             last_error_desc TEXT
         )""")
-        # Owner operation states persistence (for recovery)
         c.execute("""
         CREATE TABLE IF NOT EXISTS owner_operation_states (
             owner_id INTEGER,
@@ -1341,15 +1338,15 @@ def handle_callback_query(callback_query):
         
         elif callback_data == "owner_list_users":
             clear_owner_state(user_id)
-            handle_command(user_id, username, "/listusers", "")
+            handle_list_users_command(user_id, username)
         
         elif callback_data == "owner_list_suspended":
             clear_owner_state(user_id)
-            handle_command(user_id, username, "/listsuspended", "")
+            handle_list_suspended_command(user_id, username)
         
         elif callback_data == "owner_bot_info":
             clear_owner_state(user_id)
-            handle_command(user_id, username, "/botinfo", "")
+            handle_bot_info_command(user_id, username)
         
         elif callback_data == "owner_broadcast":
             set_owner_state(user_id, "broadcast")
@@ -1427,7 +1424,7 @@ def handle_owner_state_input(owner_id: int, username: str, text: str):
         # Handle broadcast
         if not text:
             send_message(owner_id, "⚠️ Please provide a message to broadcast.")
-            return jsonify({"ok": True})
+            return jsonify({"ok": True}")
         
         with _db_lock:
             c = GLOBAL_DB_CONN.cursor()
@@ -1559,6 +1556,89 @@ def handle_owner_state_input(owner_id: int, username: str, text: str):
     
     return jsonify({"ok": True})
 
+# Helper functions for owner commands (used by callback queries)
+def handle_list_users_command(user_id: int, username: str):
+    """Handle listing all users"""
+    with _db_lock:
+        c = GLOBAL_DB_CONN.cursor()
+        c.execute("SELECT user_id, username, added_at FROM allowed_users ORDER BY added_at DESC")
+        rows = c.fetchall()
+    lines = []
+    for r in rows:
+        uid, uname, added_at_utc = r
+        uname_s = f"({at_username(uname)})" if uname else "(no username)"
+        added_at_wat = utc_to_wat_ts(added_at_utc)
+        lines.append(f"{uid} {uname_s} added={added_at_wat}")
+    send_message_with_keyboard(user_id, "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)"), create_owner_menu_keyboard())
+
+def handle_list_suspended_command(user_id: int, username: str):
+    """Handle listing suspended users"""
+    for row in list_suspended()[:]:
+        uid, until_utc, reason, added_at_utc = row
+        until_dt = datetime.strptime(until_utc, "%Y-%m-%d %H:%M:%S")
+        if until_dt <= datetime.utcnow():
+            unsuspend_user(uid)
+    rows = list_suspended()
+    if not rows:
+        send_message_with_keyboard(user_id, "✅ No suspended users.", create_owner_menu_keyboard())
+        return
+    lines = []
+    for r in rows:
+        uid, until_utc, reason, added_at_utc = r
+        until_wat = utc_to_wat_ts(until_utc)
+        added_wat = utc_to_wat_ts(added_at_utc)
+        uname = fetch_display_username(uid)
+        uname_s = f"({at_username(uname)})" if uname else ""
+        lines.append(f"{uid} {uname_s} suspended_until={until_wat} by={OWNER_TAG} reason={reason}")
+    send_message_with_keyboard(user_id, "🚫 Suspended users:\n" + "\n".join(lines), create_owner_menu_keyboard())
+
+def handle_bot_info_command(user_id: int, username: str):
+    """Handle bot info command"""
+    active_rows, queued_tasks = [], 0
+    with _db_lock:
+        c = GLOBAL_DB_CONN.cursor()
+        c.execute("SELECT user_id, username, SUM(total_words - IFNULL(sent_count,0)) as remaining, COUNT(*) as active_count FROM tasks WHERE status IN ('running','paused') GROUP BY user_id")
+        active_rows = c.fetchall()
+        c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
+        queued_tasks = c.fetchone()[0]
+    queued_counts = {}
+    with _db_lock:
+        c = GLOBAL_DB_CONN.cursor()
+        c.execute("SELECT user_id, COUNT(*) FROM tasks WHERE status = 'queued' GROUP BY user_id")
+        for row in c.fetchall():
+            queued_counts[row[0]] = row[1]
+    stats_rows = compute_last_hour_stats()
+    lines_active = []
+    for r in active_rows:
+        uid, uname, rem, ac = r
+        if not uname:
+            uname = fetch_display_username(uid)
+        name = f" ({at_username(uname)})" if uname else ""
+        queued_for_user = queued_counts.get(uid, 0)
+        lines_active.append(f"{uid}{name} - {int(rem)} remaining - {int(ac)} active - {queued_for_user} queued")
+    lines_stats = []
+    for uid, uname, s in stats_rows:
+        uname_final = at_username(uname) if uname else fetch_display_username(uid)
+        lines_stats.append(f"{uid} ({uname_final}) - {int(s)} words sent")
+    total_allowed = 0
+    total_suspended = 0
+    with _db_lock:
+        c = GLOBAL_DB_CONN.cursor()
+        c.execute("SELECT COUNT(*) FROM allowed_users")
+        total_allowed = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM suspended_users")
+        total_suspended = c.fetchone()[0]
+    body = (
+        f"🤖 Bot status: Online\n"
+        f"👥 Allowed users: {total_allowed}\n"
+        f"🚫 Suspended users: {total_suspended}\n"
+        f"⚙️ Active tasks: {len(active_rows)}\n"
+        f"📨 Queued tasks: {queued_tasks}\n\n"
+        "Users with active tasks:\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
+        "User stats (last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
+    )
+    send_message_with_keyboard(user_id, body, create_owner_menu_keyboard())
+
 @app.route("/", methods=["GET"])
 def root():
     return "WordSplitter running.", 200
@@ -1584,9 +1664,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         msg = (
             f"👋 Hi {who}!\n\n"
             "I split your text into individual word messages. ✂️📤\n\n"
-            f"{OWNER_TAG} commands:\n"
-            " /adduser /listusers /listsuspended /botinfo /broadcast /suspend /unsuspend\n"
-            " /ownersets (all owner commands with buttons) 🆕\n\n"
+            f"{OWNER_TAG} command:\n"
+            " /ownersets - All owner controls 🆕\n\n"
             "User commands:\n"
             " /start /example /pause /resume /status /stop /stats /about\n\n"
             "Just send any text and I'll split it for you. 🚀"
@@ -1703,208 +1782,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         send_message(user_id, f"📊 Your last 12 hours: {words} words split")
         return jsonify({"ok": True})
 
-    if command == "/adduser":
-        if not is_owner(user_id):
-            send_message(user_id, f"🔒 {OWNER_TAG} only.")
-            return jsonify({"ok": True})
-        if not args:
-            send_message(user_id, "Usage: /adduser <user_id> [username]")
-            return jsonify({"ok": True})
-        parts = re.split(r"[,\s]+", args.strip())
-        added, already, invalid = [], [], []
-        for p in parts:
-            if not p:
-                continue
-            try:
-                tid = int(p)
-            except Exception:
-                invalid.append(p)
-                continue
-            with _db_lock:
-                c = GLOBAL_DB_CONN.cursor()
-                c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (tid,))
-                if c.fetchone():
-                    already.append(tid)
-                    continue
-                c.execute("INSERT INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", (tid, "", now_ts()))
-                GLOBAL_DB_CONN.commit()
-            added.append(tid)
-            try:
-                send_message(tid, f"✅ You have been added. Send any text to start.")
-            except Exception:
-                pass
-        parts_msgs = []
-        if added: parts_msgs.append("Added: " + ", ".join(str(x) for x in added))
-        if already: parts_msgs.append("Already present: " + ", ".join(str(x) for x in already))
-        if invalid: parts_msgs.append("Invalid: " + ", ".join(invalid))
-        send_message(user_id, "✅ " + ("; ".join(parts_msgs) if parts_msgs else "No changes"))
-        return jsonify({"ok": True})
-
-    if command == "/listusers":
-        if not is_owner(user_id):
-            send_message(user_id, f"🔒 {OWNER_TAG} only.")
-            return jsonify({"ok": True})
-        with _db_lock:
-            c = GLOBAL_DB_CONN.cursor()
-            c.execute("SELECT user_id, username, added_at FROM allowed_users ORDER BY added_at DESC")
-            rows = c.fetchall()
-        lines = []
-        for r in rows:
-            uid, uname, added_at_utc = r
-            uname_s = f"({at_username(uname)})" if uname else "(no username)"
-            added_at_wat = utc_to_wat_ts(added_at_utc)
-            lines.append(f"{uid} {uname_s} added={added_at_wat}")
-        send_message(user_id, "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)"))
-        return jsonify({"ok": True})
-
-    if command == "/listsuspended":
-        if not is_owner(user_id):
-            send_message(user_id, f"🔒 {OWNER_TAG} only.")
-            return jsonify({"ok": True})
-        for row in list_suspended()[:]:
-            uid, until_utc, reason, added_at_utc = row
-            until_dt = datetime.strptime(until_utc, "%Y-%m-%d %H:%M:%S")
-            if until_dt <= datetime.utcnow():
-                unsuspend_user(uid)
-        rows = list_suspended()
-        if not rows:
-            send_message(user_id, "✅ No suspended users.")
-            return jsonify({"ok": True})
-        lines = []
-        for r in rows:
-            uid, until_utc, reason, added_at_utc = r
-            until_wat = utc_to_wat_ts(until_utc)
-            added_wat = utc_to_wat_ts(added_at_utc)
-            uname = fetch_display_username(uid)
-            uname_s = f"({at_username(uname)})" if uname else ""
-            lines.append(f"{uid} {uname_s} suspended_until={until_wat} by={OWNER_TAG} reason={reason}")
-        send_message(user_id, "🚫 Suspended users:\n" + "\n".join(lines))
-        return jsonify({"ok": True})
-
-    if command == "/botinfo":
-        if not is_owner(user_id):
-            send_message(user_id, f"🔒 {OWNER_TAG} only.")
-            return jsonify({"ok": True})
-        active_rows, queued_tasks = [], 0
-        with _db_lock:
-            c = GLOBAL_DB_CONN.cursor()
-            c.execute("SELECT user_id, username, SUM(total_words - IFNULL(sent_count,0)) as remaining, COUNT(*) as active_count FROM tasks WHERE status IN ('running','paused') GROUP BY user_id")
-            active_rows = c.fetchall()
-            c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'")
-            queued_tasks = c.fetchone()[0]
-        queued_counts = {}
-        with _db_lock:
-            c = GLOBAL_DB_CONN.cursor()
-            c.execute("SELECT user_id, COUNT(*) FROM tasks WHERE status = 'queued' GROUP BY user_id")
-            for row in c.fetchall():
-                queued_counts[row[0]] = row[1]
-        stats_rows = compute_last_hour_stats()
-        lines_active = []
-        for r in active_rows:
-            uid, uname, rem, ac = r
-            if not uname:
-                uname = fetch_display_username(uid)
-            name = f" ({at_username(uname)})" if uname else ""
-            queued_for_user = queued_counts.get(uid, 0)
-            lines_active.append(f"{uid}{name} - {int(rem)} remaining - {int(ac)} active - {queued_for_user} queued")
-        lines_stats = []
-        for uid, uname, s in stats_rows:
-            uname_final = at_username(uname) if uname else fetch_display_username(uid)
-            lines_stats.append(f"{uid} ({uname_final}) - {int(s)} words sent")
-        total_allowed = 0
-        total_suspended = 0
-        with _db_lock:
-            c = GLOBAL_DB_CONN.cursor()
-            c.execute("SELECT COUNT(*) FROM allowed_users")
-            total_allowed = c.fetchone()[0]
-            c.execute("SELECT COUNT(*) FROM suspended_users")
-            total_suspended = c.fetchone()[0]
-        body = (
-            f"🤖 Bot status: Online\n"
-            f"👥 Allowed users: {total_allowed}\n"
-            f"🚫 Suspended users: {total_suspended}\n"
-            f"⚙️ Active tasks: {len(active_rows)}\n"
-            f"📨 Queued tasks: {queued_tasks}\n\n"
-            "Users with active tasks:\n" + ("\n".join(lines_active) if lines_active else "(none)") + "\n\n"
-            "User stats (last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
-        )
-        send_message(user_id, body)
-        return jsonify({"ok": True})
-
-    if command == "/broadcast":
-        if not is_owner(user_id):
-            send_message(user_id, f"🔒 {OWNER_TAG} only.")
-            return jsonify({"ok": True})
-        if not args:
-            send_message(user_id, "Usage: /broadcast <message>")
-            return jsonify({"ok": True})
-        with _db_lock:
-            c = GLOBAL_DB_CONN.cursor()
-            c.execute("SELECT user_id FROM allowed_users")
-            rows = c.fetchall()
-        succeeded, failed = [], []
-        header = f"📣 Broadcast from {OWNER_TAG}:\n\n{args}"
-        for r in rows:
-            tid = r[0]
-            ok, reason = broadcast_send_raw(tid, header)
-            if ok:
-                succeeded.append(tid)
-            else:
-                failed.append((tid, reason))
-        summary = f"📨 Broadcast done. Success: {len(succeeded)}, Failed: {len(failed)}"
-        send_message(user_id, summary)
-        if failed:
-            notify_owners("⚠️ Broadcast failures: " + ", ".join(f"{x[0]}({x[1]})" for x in failed))
-        return jsonify({"ok": True})
-
-    if command == "/suspend":
-        if not is_owner(user_id):
-            send_message(user_id, f"🔒 {OWNER_TAG} only.")
-            return jsonify({"ok": True})
-        if not args:
-            send_message(user_id, "Usage: /suspend <telegram_user_id> <duration> [reason]\nExample: /suspend 8282747479 30s Too many requests")
-            return jsonify({"ok": True})
-        parts = args.split()
-        try:
-            target = int(parts[0])
-        except Exception:
-            send_message(user_id, "Invalid user id.")
-            return jsonify({"ok": True})
-        if len(parts) < 2:
-            send_message(user_id, "Missing duration.")
-            return jsonify({"ok": True})
-        dur = parts[1]
-        reason = " ".join(parts[2:]) if len(parts) > 2 else ""
-        m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
-        if not m:
-            send_message(user_id, "Invalid duration format. Examples: 30s 10m 2h 1d")
-            return jsonify({"ok": True})
-        val, unit = int(m.group(1)), (m.group(2) or "s")
-        mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
-        seconds = val * mul
-        suspend_user(target, seconds, reason)
-        reason_part = f" Reason: {reason}" if reason else ""
-        send_message(user_id, f"🔒 User {label_for_owner_view(target, fetch_display_username(target))} suspended until {utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))}{reason_part}")
-        return jsonify({"ok": True})
-
-    if command == "/unsuspend":
-        if not is_owner(user_id):
-            send_message(user_id, f"🔒 {OWNER_TAG} only.")
-            return jsonify({"ok": True})
-        if not args:
-            send_message(user_id, "Usage: /unsuspend <telegram_user_id>")
-            return jsonify({"ok": True})
-        try:
-            target = int(args.split()[0])
-        except Exception:
-            send_message(user_id, "Invalid user id.")
-            return jsonify({"ok": True})
-        ok = unsuspend_user(target)
-        if ok:
-            send_message(user_id, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} unsuspended.")
-        else:
-            send_message(user_id, f"ℹ️ User {target} is not suspended.")
-        return jsonify({"ok": True})
+    # REMOVED ALL INDIVIDUAL OWNER COMMANDS - Now only available through /ownersets
 
     send_message(user_id, "❓ Unknown command.")
     return jsonify({"ok": True})
