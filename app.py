@@ -1135,7 +1135,7 @@ def get_user_tasks_preview(user_id: int, hours: int, page: int = 0) -> Tuple[Lis
 
 def send_ownersets_menu(owner_id: int):
     """Send the main owner menu with inline buttons (2 buttons per row)"""
-    menu_text = f"👑 Owner Menu ({OWNER_TAG})\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nSelect an operation:"
+    menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
     
     # Arrange buttons in 2 columns per row
     keyboard = [
@@ -1534,7 +1534,7 @@ def webhook():
                             m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
                             if not m:
                                 send_message(uid, "❌ Invalid duration format. Examples: 30s 10m 2h 1d")
-                                return jsonify({"ok": True})
+                                return jsonify({"ok": True}")
                             
                             val, unit = int(m.group(1)), (m.group(2) or "s")
                             mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
@@ -1582,14 +1582,20 @@ def webhook():
                                 succeeded.append(tid)
                             else:
                                 failed.append((tid, reason))
+                        
+                        # Clear owner state BEFORE sending completion message
+                        # This ensures we're not in operation mode anymore
+                        clear_owner_state(uid)
+                        
+                        # Build summary message
                         summary = f"✅ Broadcast completed.\nSuccess: {len(succeeded)}, Failed: {len(failed)}"
                         if failed:
-                            summary += f"\n\nFailed users: {', '.join(f'{x[0]}({x[1]})' for x in failed[:10])}"
+                            failed_list = ', '.join(f'{x[0]}({x[1]})' for x in failed[:10])
+                            summary += f"\n\nFailed users: {failed_list}"
                             if len(failed) > 10:
                                 summary += f" and {len(failed)-10} more..."
                         
-                        clear_owner_state(uid)
-                        # Send completion message - FIXED: Use send_message directly
+                        # Send completion message
                         send_message(uid, f"{summary}\n\nUse /ownersets again to access the menu. 😊")
                         return jsonify({"ok": True})
                     
