@@ -1135,7 +1135,7 @@ def get_user_tasks_preview(user_id: int, hours: int, page: int = 0) -> Tuple[Lis
 
 def send_ownersets_menu(owner_id: int):
     """Send the main owner menu with inline buttons (2 buttons per row)"""
-    menu_text = f"👑 Owner Menu (Owner (@justmemmy))\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
+    menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
     
     # Arrange buttons in 2 columns per row
     keyboard = [
