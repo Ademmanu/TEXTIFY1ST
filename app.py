@@ -538,6 +538,12 @@ def broadcast_send_raw(chat_id: int, text: str):
     entities = _build_entities_for_text(text)
     if entities:
         payload["entities"] = entities
+    
+    # Acquire token for broadcast
+    if not acquire_token(timeout=5.0):
+        logger.warning("Token acquire timed out for broadcast to %s", chat_id)
+        return False, "token_acquire_timeout"
+    
     try:
         resp = _session.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=REQUESTS_TIMEOUT)
     except Exception as e:
@@ -557,10 +563,11 @@ def broadcast_send_raw(chat_id: int, text: str):
             pass
         return True, "ok"
     reason = data.get("description") if isinstance(data, dict) else "error"
+    error_code = data.get("error_code") if isinstance(data, dict) else None
     logger.info("Broadcast failed to %s: %s", chat_id, reason)
     # Record a failure for non-ok broadcast attempts
     try:
-        record_failure(chat_id, inc=1, error_code=(data.get("error_code") if isinstance(data, dict) else None), description=reason)
+        record_failure(chat_id, inc=1, error_code=error_code, description=reason)
     except Exception:
         pass
     return False, reason
@@ -1505,6 +1512,7 @@ def webhook():
                         result_msg = "✅ " + ("; ".join(parts_msgs) if parts_msgs else "No changes")
                         
                         clear_owner_state(uid)
+                        # Send completion message
                         send_message(uid, f"{result_msg}\n\nUse /ownersets again to access the menu. 😊")
                         return jsonify({"ok": True})
                     
@@ -1537,6 +1545,7 @@ def webhook():
                             until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
                             
                             clear_owner_state(uid)
+                            # Send completion message
                             send_message(uid, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} suspended until {until_wat}.{reason_part}\n\nUse /ownersets again to access the menu. 😊")
                             return jsonify({"ok": True})
                     
@@ -1554,6 +1563,7 @@ def webhook():
                             result = f"ℹ️ User {target} is not suspended."
                         
                         clear_owner_state(uid)
+                        # Send completion message
                         send_message(uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
                         return jsonify({"ok": True})
                     
@@ -1579,6 +1589,7 @@ def webhook():
                                 summary += f" and {len(failed)-10} more..."
                         
                         clear_owner_state(uid)
+                        # Send completion message - FIXED: Use send_message directly
                         send_message(uid, f"{summary}\n\nUse /ownersets again to access the menu. 😊")
                         return jsonify({"ok": True})
                     
@@ -1795,14 +1806,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     if command == "/stats":
         words = compute_last_12h_stats(user_id)
         send_message(user_id, f"📊 Your last 12 hours: {words} words split")
-        return jsonify({"ok": True})
-
-    # Remove all individual owner commands - they're now in /ownersets
-    if command in ["/adduser", "/listusers", "/listsuspended", "/botinfo", "/broadcast", "/suspend", "/unsuspend"]:
-        if not is_owner(user_id):
-            send_message(user_id, f"🔒 {OWNER_TAG} only.")
-            return jsonify({"ok": True})
-        send_message(user_id, f"ℹ️ This command has been moved to /ownersets menu. Please use /ownersets instead. 😊")
         return jsonify({"ok": True})
 
     send_message(user_id, "❓ Unknown command.")
