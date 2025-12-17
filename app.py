@@ -1209,7 +1209,6 @@ def webhook():
                     "chat_id": user_id,
                     "message_id": message_id,
                     "text": "✨ Operation cancelled! Use /ownersets to access the owner menu again.",
-                    "reply_markup": None
                 }, timeout=3)
                 return jsonify({"ok": True})
             
@@ -1222,7 +1221,7 @@ def webhook():
                 _session.post(f"{TELEGRAM_API}/editMessageText", json={
                     "chat_id": user_id,
                     "message_id": message_id,
-                    "text": "👤 *Add User*\n\nPlease send me the User ID you'd like to add.\nYou can also include a username after the ID if you want!",
+                    "text": "👤 *Add User*\n\nPlease send me the User ID you'd like to add.\nYou can also include multiple IDs separated by spaces or commas!",
                     "parse_mode": "Markdown",
                     "reply_markup": create_cancel_keyboard()
                 }, timeout=3)
@@ -1247,11 +1246,8 @@ def webhook():
                     "chat_id": user_id,
                     "message_id": message_id,
                     "text": response_text,
-                    "parse_mode": "Markdown",
-                    "reply_markup": None
+                    "parse_mode": "Markdown"
                 }, timeout=3)
-                # Send follow-up message
-                send_message(user_id, "✅ Use /ownersets to access the owner menu again.")
                 
             elif operation == "list_suspended":
                 _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
@@ -1280,11 +1276,8 @@ def webhook():
                     "chat_id": user_id,
                     "message_id": message_id,
                     "text": response_text,
-                    "parse_mode": "Markdown",
-                    "reply_markup": None
+                    "parse_mode": "Markdown"
                 }, timeout=3)
-                # Send follow-up message
-                send_message(user_id, "✅ Use /ownersets to access the owner menu again.")
                 
             elif operation == "bot_info":
                 _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
@@ -1338,11 +1331,8 @@ def webhook():
                     "chat_id": user_id,
                     "message_id": message_id,
                     "text": response_text,
-                    "parse_mode": "Markdown",
-                    "reply_markup": None
+                    "parse_mode": "Markdown"
                 }, timeout=3)
-                # Send follow-up message
-                send_message(user_id, "✅ Use /ownersets to access the owner menu again.")
                 
             elif operation == "broadcast":
                 set_owner_state(user_id, "broadcast", 1)
@@ -1423,12 +1413,16 @@ def webhook():
             except Exception:
                 logger.exception("webhook: update allowed_users username failed")
 
-            # Check if owner is in middle of an operation
+            # Check if owner is in middle of an operation - block regular processing
             if uid in OWNER_IDS:
                 state = get_owner_state(uid)
                 if state and text and not text.startswith("/"):
-                    # Handle owner state operation - don't process as task
+                    # Handle owner state operation
                     return handle_owner_state_message(uid, username, text, state)
+                elif state and text.startswith("/"):
+                    # Owner trying to use command while in operation - clear state first
+                    clear_owner_state(uid)
+                    # Let it fall through to normal command handling
 
             if text.startswith("/"):
                 parts = text.split(None, 1)
@@ -1436,10 +1430,6 @@ def webhook():
                 args = parts[1] if len(parts) > 1 else ""
                 return handle_command(uid, username, cmd, args)
             else:
-                # If owner is in state, don't process as task
-                if uid in OWNER_IDS and get_owner_state(uid):
-                    send_message(uid, "⚠️ Please complete your current owner operation first or use /ownersets to cancel.")
-                    return jsonify({"ok": True})
                 return handle_user_text(uid, username, text)
     except Exception:
         logger.exception("webhook handling error")
@@ -1497,20 +1487,23 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
                 except Exception:
                     pass
             
-            parts_msgs = []
-            if added: parts_msgs.append("Added: " + ", ".join(str(x) for x in added))
-            if already: parts_msgs.append("Already present: " + ", ".join(str(x) for x in already))
-            if invalid: parts_msgs.append("Invalid: " + ", ".join(invalid))
-            
+            # Build clear success/failure message
             if added:
-                response_text = f"✅ *Successfully added {len(added)} user(s)!*\n\n" + ("; ".join(parts_msgs))
+                success_msg = f"✅ *Add User Successful!*\n\nAdded {len(added)} user(s): {', '.join(str(x) for x in added)}"
+                if already:
+                    success_msg += f"\n\n⚠️ Already added: {', '.join(str(x) for x in already)}"
+                if invalid:
+                    success_msg += f"\n\n❌ Invalid entries: {', '.join(invalid)}"
+            elif already:
+                success_msg = f"ℹ️ *No Changes*\n\nAll users were already added: {', '.join(str(x) for x in already)}"
+            elif invalid:
+                success_msg = f"❌ *Invalid Input*\n\nNo valid user IDs found. Invalid entries: {', '.join(invalid)}"
             else:
-                response_text = f"⚠️ *No new users added.*\n\n" + ("; ".join(parts_msgs) if parts_msgs else "No changes")
+                success_msg = "❌ *No Input*\n\nNo user IDs provided."
             
-            send_message(user_id, response_text)
+            success_msg += "\n\nUse /ownersets to access the owner menu again."
+            send_message(user_id, success_msg)
             clear_owner_state(user_id)
-            # Send follow-up message
-            send_message(user_id, "✅ Operation completed! Use /ownersets to access the owner menu again.")
             
     elif operation == "broadcast":
         if step == 1:
@@ -1529,17 +1522,20 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
                 else:
                     failed.append((tid, reason))
             
-            if failed:
-                summary = f"📨 *Broadcast Results*\n\n✅ Success: {len(succeeded)}\n❌ Failed: {len(failed)}\n\n*Failed users:*\n" + ", ".join(f"{x[0]}({x[1]})" for x in failed[:10])
-                if len(failed) > 10:
-                    summary += f"\n... and {len(failed) - 10} more"
+            # Build clear success/failure message
+            if succeeded:
+                success_msg = f"✅ *Broadcast Successful!*\n\nSent to {len(succeeded)} user(s)."
+                if failed:
+                    success_msg += f"\n\n⚠️ Failed for {len(failed)} user(s)."
             else:
-                summary = f"✅ *Broadcast Successful!*\n\nSent to {len(succeeded)} user(s)."
+                success_msg = f"❌ *Broadcast Failed*\n\nCould not send to any users."
             
-            send_message(user_id, summary)
+            success_msg += "\n\nUse /ownersets to access the owner menu again."
+            send_message(user_id, success_msg)
+            
+            if failed:
+                notify_owners("⚠️ Broadcast failures: " + ", ".join(f"{x[0]}({x[1]})" for x in failed))
             clear_owner_state(user_id)
-            # Send follow-up message
-            send_message(user_id, "✅ Operation completed! Use /ownersets to access the owner menu again.")
             
     elif operation == "suspend":
         if step == 1:
@@ -1565,12 +1561,13 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
             mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
             seconds = val * mul
             suspend_user(target, seconds, reason)
-            reason_part = f"\nReason: {reason}" if reason else ""
+            
             until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
-            send_message(user_id, f"✅ *User Suspended!*\n\nUser: {label_for_owner_view(target, fetch_display_username(target))}\nUntil: {until_wat}{reason_part}")
+            reason_part = f"\nReason: {reason}" if reason else ""
+            success_msg = f"✅ *User Suspended Successfully!*\n\nUser: {label_for_owner_view(target, fetch_display_username(target))}\nUntil: {until_wat}{reason_part}"
+            success_msg += "\n\nUse /ownersets to access the owner menu again."
+            send_message(user_id, success_msg)
             clear_owner_state(user_id)
-            # Send follow-up message
-            send_message(user_id, "✅ Operation completed! Use /ownersets to access the owner menu again.")
             
     elif operation == "unsuspend":
         if step == 1:
@@ -1582,12 +1579,13 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
             
             ok = unsuspend_user(target)
             if ok:
-                send_message(user_id, f"✅ *User Unsuspended!*\n\nUser: {label_for_owner_view(target, fetch_display_username(target))}")
+                success_msg = f"✅ *User Unsuspended Successfully!*\n\nUser: {label_for_owner_view(target, fetch_display_username(target))}"
             else:
-                send_message(user_id, f"ℹ️ *User Not Suspended*\n\nUser {target} is not currently suspended.")
+                success_msg = f"ℹ️ *User Not Suspended*\n\nUser {target} is not currently suspended."
+            
+            success_msg += "\n\nUse /ownersets to access the owner menu again."
+            send_message(user_id, success_msg)
             clear_owner_state(user_id)
-            # Send follow-up message
-            send_message(user_id, "✅ Operation completed! Use /ownersets to access the owner menu again.")
             
     elif operation == "check_preview":
         if step == 1:
@@ -1611,17 +1609,16 @@ def handle_owner_state_message(user_id: int, username: str, text: str, state: di
                 previews = get_user_task_previews(target_user, hours)
                 
                 if not previews:
-                    response_text = f"🔍 *User Task Preview*\n\nUser: {label_for_owner_view(target_user, fetch_display_username(target_user))}\nHours: {hours}\n\nNo tasks found in the last {hours} hour(s). 📭"
+                    response_text = f"📭 *No Tasks Found*\n\nUser: {label_for_owner_view(target_user, fetch_display_username(target_user))}\nTimeframe: Last {hours} hour(s)\n\nNo tasks found in the specified timeframe."
                 else:
                     preview_text = "\n".join(previews[:20])  # Limit to 20 tasks
                     if len(previews) > 20:
                         preview_text += f"\n\n... and {len(previews) - 20} more tasks"
-                    response_text = f"🔍 *User Task Preview*\n\nUser: {label_for_owner_view(target_user, fetch_display_username(target_user))}\nHours: {hours}\n\n*First two words of each task:*\n\n{preview_text}"
+                    response_text = f"🔍 *User Task Preview*\n\nUser: {label_for_owner_view(target_user, fetch_display_username(target_user))}\nTimeframe: Last {hours} hour(s)\n\n*First two words of each task:*\n\n{preview_text}"
                 
+                response_text += "\n\nUse /ownersets to access the owner menu again."
                 send_message(user_id, response_text)
                 clear_owner_state(user_id)
-                # Send follow-up message
-                send_message(user_id, "✅ Operation completed! Use /ownersets to access the owner menu again.")
                 
             except ValueError:
                 send_message(user_id, "❌ *Invalid hours.* Please send a valid number:", reply_markup=create_cancel_keyboard())
@@ -1748,30 +1745,26 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         # Clear any existing state
         clear_owner_state(user_id)
         # Send owner control panel with message matching button layout
-        send_message(user_id, 
-                    "👑 *Owner Control Panel*\n\n"
-                    "➕ Add User      👥 List Users\n"
-                    "🚫 List Suspended 🤖 Bot Info\n"
-                    "📣 Broadcast      ⏸️ Suspend User\n"
-                    "▶️ Unsuspend User 🔍 Check User Preview\n\n"
-                    "Select an operation below:",
-                    reply_markup=create_ownersets_keyboard())
+        owner_message = "👑 *Owner Control Panel*\n\nPlease select an option below:"
+        send_message(user_id, owner_message, reply_markup=create_ownersets_keyboard())
         return jsonify({"ok": True})
 
     send_message(user_id, "❓ Unknown command.")
     return jsonify({"ok": True})
 
 def handle_user_text(user_id: int, username: str, text: str):
-    # Check if owner is in middle of an operation - prevent task processing
-    if user_id in OWNER_IDS and get_owner_state(user_id):
-        send_message(user_id, "⚠️ Please complete your current owner operation first or use /ownersets to cancel.")
-        return jsonify({"ok": True})
+    # Check if owner is in middle of an operation - block task processing
+    if user_id in OWNER_IDS:
+        state = get_owner_state(user_id)
+        if state:
+            # Owner is in operation mode, don't process as task
+            send_message(user_id, "⚠️ You're currently in an owner operation. Please complete or cancel it first.")
+            return jsonify({"ok": True})
     
     if user_id not in OWNER_IDS and not is_allowed(user_id):
         send_message(user_id, f"🚫 Sorry, you are not allowed. {OWNER_TAG} notified.\nYour ID: {user_id}")
         notify_owners(f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
         return jsonify({"ok": True})
-    
     if is_suspended(user_id):
         with _db_lock:
             c = GLOBAL_DB_CONN.cursor()
@@ -1781,7 +1774,6 @@ def handle_user_text(user_id: int, username: str, text: str):
             until_wat = utc_to_wat_ts(until_utc)
         send_message(user_id, f"⛔ You have been suspended until {until_wat} by {OWNER_TAG}.")
         return jsonify({"ok": True})
-    
     res = enqueue_task(user_id, username, text)
     if not res["ok"]:
         if res["reason"] == "empty":
@@ -1792,7 +1784,6 @@ def handle_user_text(user_id: int, username: str, text: str):
             return jsonify({"ok": True})
         send_message(user_id, "❗ Could not queue task. Try later.")
         return jsonify({"ok": True})
-    
     start_user_worker_if_needed(user_id)
     notify_user_worker(user_id)
     active, queued = get_user_task_counts(user_id)
