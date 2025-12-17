@@ -1570,6 +1570,9 @@ def webhook():
                     elif operation == "broadcast":
                         logger.info(f"Owner {uid} starting broadcast with text: {text[:100]}...")
                         
+                        # Clear owner state IMMEDIATELY to prevent re-processing
+                        clear_owner_state(uid)
+                        
                         # IMPORTANT: Don't enqueue broadcast text as a task
                         with _db_lock:
                             c = GLOBAL_DB_CONN.cursor()
@@ -1585,6 +1588,7 @@ def webhook():
                         # Send initial progress
                         send_message(uid, f"📤 Starting broadcast to {total_users} users...")
                         
+                        # ACTUALLY SEND THE BROADCAST
                         for r in rows:
                             tid = r[0]
                             ok, reason = broadcast_send_raw(tid, header)
@@ -1592,9 +1596,6 @@ def webhook():
                                 succeeded.append(tid)
                             else:
                                 failed.append((tid, reason))
-                        
-                        # Clear owner state BEFORE sending completion
-                        clear_owner_state(uid)
                         
                         # Build summary message
                         summary = f"✅ Broadcast completed!\n\n📊 Results:\nTotal users: {total_users}\nSuccessfully sent: {len(succeeded)}\nFailed: {len(failed)}"
@@ -1607,26 +1608,13 @@ def webhook():
                         
                         summary += f"\n\nUse /ownersets again to access the menu. 😊"
                         
-                        # Send completion message with retry
-                        max_retries = 3
-                        for attempt in range(max_retries):
-                            try:
-                                result = send_message(uid, summary)
-                                if result:
-                                    logger.info(f"Broadcast completion sent to owner {uid}")
-                                    break
-                                else:
-                                    logger.warning(f"Failed to send broadcast completion to owner {uid}, attempt {attempt + 1}")
-                                    time.sleep(1)
-                            except Exception as e:
-                                logger.error(f"Error sending broadcast completion to owner {uid}: {e}")
-                                if attempt < max_retries - 1:
-                                    time.sleep(1)
+                        # Send completion message - FORCE IT
+                        send_message(uid, summary)
                         
                         logger.info(f"Broadcast completed for owner {uid}: {len(succeeded)} succeeded, {len(failed)} failed")
                         
-                        # Return immediately to prevent further processing
-                        return jsonify({"ok": True})
+                        # CRITICAL: Return immediately to prevent ANY further processing
+                        return jsonify({"ok": True, "processed_as_broadcast": True})
                     
                     elif operation == "checkpreview":
                         if step == 0:
@@ -1849,8 +1837,9 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 def handle_user_text(user_id: int, username: str, text: str):
     # BLOCK OWNER TASK PROCESSING: If owner is in operation mode, don't process their text as task
     if user_id in OWNER_IDS and is_owner_in_operation(user_id):
-        # Owner is in middle of an operation - send helpful message
-        send_message(user_id, "⚠️ You're currently in an owner operation. Please complete it or use /ownersets to cancel.")
+        # This should not happen if broadcast was processed correctly
+        logger.warning(f"Owner {user_id} text reached handle_user_text while in operation state. Text: {text[:50]}...")
+        # Don't process it as a task
         return jsonify({"ok": True})
     
     if user_id not in OWNER_IDS and not is_allowed(user_id):
