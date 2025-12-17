@@ -1534,7 +1534,7 @@ def webhook():
                             m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
                             if not m:
                                 send_message(uid, "❌ Invalid duration format. Examples: 30s 10m 2h 1d")
-                                return jsonify({"ok": True})
+                                return jsonify({"ok": True}")
                             
                             val, unit = int(m.group(1)), (m.group(2) or "s")
                             mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
@@ -1568,13 +1568,23 @@ def webhook():
                         return jsonify({"ok": True})
                     
                     elif operation == "broadcast":
+                        logger.info(f"Owner {uid} starting broadcast with text: {text[:100]}...")
+                        
                         # IMPORTANT: Don't enqueue broadcast text as a task
                         with _db_lock:
                             c = GLOBAL_DB_CONN.cursor()
                             c.execute("SELECT user_id FROM allowed_users")
                             rows = c.fetchall()
+                        
+                        total_users = len(rows)
+                        logger.info(f"Broadcast to {total_users} users")
+                        
                         succeeded, failed = [], []
                         header = f"📣 Broadcast from {OWNER_TAG}:\n\n{text}"
+                        
+                        # Send initial progress
+                        send_message(uid, f"📤 Starting broadcast to {total_users} users...")
+                        
                         for r in rows:
                             tid = r[0]
                             ok, reason = broadcast_send_raw(tid, header)
@@ -1583,20 +1593,39 @@ def webhook():
                             else:
                                 failed.append((tid, reason))
                         
-                        # Clear owner state BEFORE sending completion message
-                        # This ensures we're not in operation mode anymore
+                        # Clear owner state BEFORE sending completion
                         clear_owner_state(uid)
                         
                         # Build summary message
-                        summary = f"✅ Broadcast completed.\nSuccess: {len(succeeded)}, Failed: {len(failed)}"
-                        if failed:
-                            failed_list = ', '.join(f'{x[0]}({x[1]})' for x in failed[:10])
-                            summary += f"\n\nFailed users: {failed_list}"
-                            if len(failed) > 10:
-                                summary += f" and {len(failed)-10} more..."
+                        summary = f"✅ Broadcast completed!\n\n📊 Results:\nTotal users: {total_users}\nSuccessfully sent: {len(succeeded)}\nFailed: {len(failed)}"
                         
-                        # Send completion message
-                        send_message(uid, f"{summary}\n\nUse /ownersets again to access the menu. 😊")
+                        if failed:
+                            failed_list = ', '.join(f'{x[0]}({x[1]})' for x in failed[:5])
+                            summary += f"\n\n❌ Failed users (first 5): {failed_list}"
+                            if len(failed) > 5:
+                                summary += f" and {len(failed)-5} more..."
+                        
+                        summary += f"\n\nUse /ownersets again to access the menu. 😊"
+                        
+                        # Send completion message with retry
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                result = send_message(uid, summary)
+                                if result:
+                                    logger.info(f"Broadcast completion sent to owner {uid}")
+                                    break
+                                else:
+                                    logger.warning(f"Failed to send broadcast completion to owner {uid}, attempt {attempt + 1}")
+                                    time.sleep(1)
+                            except Exception as e:
+                                logger.error(f"Error sending broadcast completion to owner {uid}: {e}")
+                                if attempt < max_retries - 1:
+                                    time.sleep(1)
+                        
+                        logger.info(f"Broadcast completed for owner {uid}: {len(succeeded)} succeeded, {len(failed)} failed")
+                        
+                        # Return immediately to prevent further processing
                         return jsonify({"ok": True})
                     
                     elif operation == "checkpreview":
