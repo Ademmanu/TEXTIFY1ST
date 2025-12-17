@@ -1137,13 +1137,14 @@ def send_ownersets_menu(owner_id: int):
     """Send the main owner menu with inline buttons (2 buttons per row)"""
     menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
     
-    # Arrange buttons in 2 columns per row
+    # Updated inline buttons as requested:
+    # - Fourth row contains only "Check User Preview"
+    # - No "Close Menu" button (fifth row removed)
     keyboard = [
         [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
         [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
         [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-        [{"text": "📣 Broadcast", "callback_data": "owner_broadcast"}, {"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}],
-        [{"text": "❌ Close Menu", "callback_data": "owner_close"}]
+        [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]  # Single button in fourth row
     ]
     
     reply_markup = {"inline_keyboard": keyboard}
@@ -1176,25 +1177,7 @@ def webhook():
                 return jsonify({"ok": True})
             
             # Handle callback data
-            if data == "owner_close":
-                try:
-                    _session.post(f"{TELEGRAM_API}/deleteMessage", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"]
-                    }, timeout=2)
-                except Exception:
-                    pass
-                try:
-                    _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "✅ Menu closed."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                clear_owner_state(uid)
-                return jsonify({"ok": True})
-            
-            elif data == "owner_botinfo":
+            if data == "owner_botinfo":
                 # Get bot info and return to menu
                 active_rows, queued_tasks = [], 0
                 with _db_lock:
@@ -1240,12 +1223,13 @@ def webhook():
                     "User stats (last 1h):\n" + ("\n".join(lines_stats) if lines_stats else "(none)")
                 )
                 
+                # Instead of showing "Back to Menu", redisplay the Owner Menu directly
+                send_ownersets_menu(uid)
+                
                 try:
-                    _session.post(f"{TELEGRAM_API}/editMessageText", json={
+                    _session.post(f"{TELEGRAM_API}/deleteMessage", json={
                         "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"],
-                        "text": body,
-                        "reply_markup": {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}]]}
+                        "message_id": callback["message"]["message_id"]
                     }, timeout=2)
                 except Exception:
                     pass
@@ -1271,12 +1255,13 @@ def webhook():
                     lines.append(f"{uid2} {uname_s} added={added_at_wat}")
                 body = "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
                 
+                # Redisplay the Owner Menu directly
+                send_ownersets_menu(uid)
+                
                 try:
-                    _session.post(f"{TELEGRAM_API}/editMessageText", json={
+                    _session.post(f"{TELEGRAM_API}/deleteMessage", json={
                         "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"],
-                        "text": body,
-                        "reply_markup": {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}]]}
+                        "message_id": callback["message"]["message_id"]
                     }, timeout=2)
                 except Exception:
                     pass
@@ -1310,26 +1295,9 @@ def webhook():
                         lines.append(f"{uid2} {uname_s} until={until_wat} reason={reason}")
                     body = "🚫 Suspended users:\n" + "\n".join(lines)
                 
-                try:
-                    _session.post(f"{TELEGRAM_API}/editMessageText", json={
-                        "chat_id": callback["message"]["chat"]["id"],
-                        "message_id": callback["message"]["message_id"],
-                        "text": body,
-                        "reply_markup": {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}]]}
-                    }, timeout=2)
-                except Exception:
-                    pass
-                try:
-                    _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
-                        "callback_query_id": callback.get("id"),
-                        "text": "✅ Suspended list loaded."
-                    }, timeout=2)
-                except Exception:
-                    pass
-                return jsonify({"ok": True})
-            
-            elif data == "owner_backtomenu":
+                # Redisplay the Owner Menu directly
                 send_ownersets_menu(uid)
+                
                 try:
                     _session.post(f"{TELEGRAM_API}/deleteMessage", json={
                         "chat_id": callback["message"]["chat"]["id"],
@@ -1340,7 +1308,7 @@ def webhook():
                 try:
                     _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
                         "callback_query_id": callback.get("id"),
-                        "text": "✅ Returning to menu."
+                        "text": "✅ Suspended list loaded."
                     }, timeout=2)
                 except Exception:
                     pass
@@ -1359,7 +1327,7 @@ def webhook():
                         
                         if not tasks:
                             body = f"📋 No tasks found for user {target_user} in the last {hours} hours."
-                            keyboard = [[{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}]]
+                            keyboard = []
                         else:
                             lines = []
                             for task in tasks:
@@ -1375,7 +1343,6 @@ def webhook():
                                 nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_{page+1}"})
                             if nav_buttons:
                                 keyboard.append(nav_buttons)
-                            keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
                         
                         try:
                             _session.post(f"{TELEGRAM_API}/editMessageText", json={
@@ -1394,7 +1361,7 @@ def webhook():
                             pass
                 return jsonify({"ok": True})
             
-            elif data in ["owner_adduser", "owner_suspend", "owner_unsuspend", "owner_broadcast", "owner_checkpreview"]:
+            elif data in ["owner_adduser", "owner_suspend", "owner_unsuspend", "owner_checkpreview"]:
                 # Operations that require additional input
                 operation = data.replace("owner_", "")
                 set_owner_state(uid, {"operation": operation, "step": 0})
@@ -1403,7 +1370,6 @@ def webhook():
                     "adduser": "👤 Please send the User ID to add (you can add multiple IDs separated by spaces or commas):",
                     "suspend": "⏸️ Please send:\n1. User ID\n2. Duration (e.g., 30s, 10m, 2h, 1d)\n3. Optional reason\n\nExample: 123456789 30s Too many requests",
                     "unsuspend": "▶️ Please send the User ID to unsuspend:",
-                    "broadcast": "📣 Please send the broadcast message:",
                     "checkpreview": "🔍 Please send the User ID to check:"
                 }
                 
@@ -1512,8 +1478,9 @@ def webhook():
                         result_msg = "✅ " + ("; ".join(parts_msgs) if parts_msgs else "No changes")
                         
                         clear_owner_state(uid)
-                        # Send completion message
-                        send_message(uid, f"{result_msg}\n\nUse /ownersets again to access the menu. 😊")
+                        # Send completion message and redisplay menu
+                        send_message(uid, f"{result_msg}")
+                        send_ownersets_menu(uid)
                         return jsonify({"ok": True})
                     
                     elif operation == "suspend":
@@ -1545,8 +1512,9 @@ def webhook():
                             until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
                             
                             clear_owner_state(uid)
-                            # Send completion message
-                            send_message(uid, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} suspended until {until_wat}.{reason_part}\n\nUse /ownersets again to access the menu. 😊")
+                            # Send completion message and redisplay menu
+                            send_message(uid, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} suspended until {until_wat}.{reason_part}")
+                            send_ownersets_menu(uid)
                             return jsonify({"ok": True})
                     
                     elif operation == "unsuspend":
@@ -1563,58 +1531,10 @@ def webhook():
                             result = f"ℹ️ User {target} is not suspended."
                         
                         clear_owner_state(uid)
-                        # Send completion message
-                        send_message(uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
+                        # Send completion message and redisplay menu
+                        send_message(uid, f"{result}")
+                        send_ownersets_menu(uid)
                         return jsonify({"ok": True})
-                    
-                    elif operation == "broadcast":
-                        logger.info(f"Owner {uid} starting broadcast with text: {text[:100]}...")
-                        
-                        # Clear owner state IMMEDIATELY to prevent re-processing
-                        clear_owner_state(uid)
-                        
-                        # IMPORTANT: Don't enqueue broadcast text as a task
-                        with _db_lock:
-                            c = GLOBAL_DB_CONN.cursor()
-                            c.execute("SELECT user_id FROM allowed_users")
-                            rows = c.fetchall()
-                        
-                        total_users = len(rows)
-                        logger.info(f"Broadcast to {total_users} users")
-                        
-                        succeeded, failed = [], []
-                        header = f"📣 Broadcast from {OWNER_TAG}:\n\n{text}"
-                        
-                        # Send initial progress
-                        send_message(uid, f"📤 Starting broadcast to {total_users} users...")
-                        
-                        # ACTUALLY SEND THE BROADCAST
-                        for r in rows:
-                            tid = r[0]
-                            ok, reason = broadcast_send_raw(tid, header)
-                            if ok:
-                                succeeded.append(tid)
-                            else:
-                                failed.append((tid, reason))
-                        
-                        # Build summary message
-                        summary = f"✅ Broadcast completed!\n\n📊 Results:\nTotal users: {total_users}\nSuccessfully sent: {len(succeeded)}\nFailed: {len(failed)}"
-                        
-                        if failed:
-                            failed_list = ', '.join(f'{x[0]}({x[1]})' for x in failed[:5])
-                            summary += f"\n\n❌ Failed users (first 5): {failed_list}"
-                            if len(failed) > 5:
-                                summary += f" and {len(failed)-5} more..."
-                        
-                        summary += f"\n\nUse /ownersets again to access the menu. 😊"
-                        
-                        # Send completion message - FORCE IT
-                        send_message(uid, summary)
-                        
-                        logger.info(f"Broadcast completed for owner {uid}: {len(succeeded)} succeeded, {len(failed)} failed")
-                        
-                        # CRITICAL: Return immediately to prevent ANY further processing
-                        return jsonify({"ok": True, "processed_as_broadcast": True})
                     
                     elif operation == "checkpreview":
                         if step == 0:
@@ -1653,7 +1573,7 @@ def webhook():
                             
                             if not tasks:
                                 body = f"📋 No tasks found for user {target_user} in the last {hours} hours."
-                                keyboard = [[{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}]]
+                                keyboard = []
                             else:
                                 lines = []
                                 for task in tasks:
@@ -1667,12 +1587,13 @@ def webhook():
                                     nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_1"})
                                 if nav_buttons:
                                     keyboard.append(nav_buttons)
-                                keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
                             
                             clear_owner_state(uid)
                             
                             # Send the preview
                             send_message(uid, body, {"inline_keyboard": keyboard})
+                            # Redisplay the Owner Menu
+                            send_ownersets_menu(uid)
                             return jsonify({"ok": True})
             
             # Handle commands
@@ -1837,9 +1758,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 def handle_user_text(user_id: int, username: str, text: str):
     # BLOCK OWNER TASK PROCESSING: If owner is in operation mode, don't process their text as task
     if user_id in OWNER_IDS and is_owner_in_operation(user_id):
-        # This should not happen if broadcast was processed correctly
-        logger.warning(f"Owner {user_id} text reached handle_user_text while in operation state. Text: {text[:50]}...")
-        # Don't process it as a task
+        # Owner is in middle of an operation - send helpful message
+        send_message(user_id, "⚠️ You're currently in an owner operation. Please complete it or use /ownersets to cancel.")
         return jsonify({"ok": True})
     
     if user_id not in OWNER_IDS and not is_allowed(user_id):
