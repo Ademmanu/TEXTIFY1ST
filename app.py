@@ -1534,7 +1534,7 @@ def webhook():
                             m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
                             if not m:
                                 send_message(uid, "❌ Invalid duration format. Examples: 30s 10m 2h 1d")
-                                return jsonify({"ok": True}")
+                                return jsonify({"ok": True})
                             
                             val, unit = int(m.group(1)), (m.group(2) or "s")
                             mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
