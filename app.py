@@ -1122,18 +1122,15 @@ def get_user_tasks_preview(user_id: int, hours: int, page: int = 0) -> Tuple[Lis
     return paginated_tasks, total_tasks, total_pages
 
 def send_ownersets_menu(owner_id: int):
-    """Send the main owner menu with inline buttons"""
+    """Send the main owner menu with inline buttons (2 buttons per row)"""
     menu_text = f"👑 Owner Menu ({OWNER_TAG})\n\nSelect an operation:"
     
+    # Arrange buttons in 2 columns per row
     keyboard = [
-        [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}],
-        [{"text": "👥 List Users", "callback_data": "owner_listusers"}],
-        [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}],
-        [{"text": "➕ Add User", "callback_data": "owner_adduser"}],
-        [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}],
-        [{"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-        [{"text": "📣 Broadcast", "callback_data": "owner_broadcast"}],
-        [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}],
+        [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
+        [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
+        [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
+        [{"text": "📣 Broadcast", "callback_data": "owner_broadcast"}, {"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}],
         [{"text": "❌ Close Menu", "callback_data": "owner_close"}]
     ]
     
@@ -1359,13 +1356,13 @@ def webhook():
                             body = f"📋 Task preview for user {target_user} (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
                             
                             keyboard = []
+                            nav_buttons = []
                             if page > 0:
-                                keyboard.append([{"text": "⬅️ Previous", "callback_data": f"owner_checkpreview_{target_user}_{page-1}"}])
+                                nav_buttons.append({"text": "⬅️ Previous", "callback_data": f"owner_checkpreview_{target_user}_{page-1}"})
                             if page + 1 < total_pages:
-                                if keyboard:
-                                    keyboard[0].append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_{page+1}"})
-                                else:
-                                    keyboard.append([{"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_{page+1}"}])
+                                nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_{page+1}"})
+                            if nav_buttons:
+                                keyboard.append(nav_buttons)
                             keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
                         
                         try:
@@ -1435,7 +1432,7 @@ def webhook():
                     }, timeout=2)
                 except Exception:
                     pass
-                return jsonify({"ok": True})
+                return jsonify({"ok": True}")
             
             # Answer callback query to remove loading state
             try:
@@ -1464,12 +1461,13 @@ def webhook():
             except Exception:
                 logger.exception("webhook: update allowed_users username failed")
 
-            # Check if owner is in input mode
+            # Check if owner is in input mode - handle BEFORE checking commands
             state = get_owner_state(uid)
             if state and uid in OWNER_IDS:
                 operation = state.get("operation")
                 step = state.get("step", 0)
                 
+                # IMPORTANT: Return immediately to prevent text splitting for owner inputs
                 if operation == "adduser":
                     parts = re.split(r"[,\s]+", text.strip())
                     added, already, invalid = [], [], []
@@ -1554,6 +1552,7 @@ def webhook():
                     return jsonify({"ok": True})
                 
                 elif operation == "broadcast":
+                    # IMPORTANT: Don't enqueue broadcast text as a task
                     with _db_lock:
                         c = GLOBAL_DB_CONN.cursor()
                         c.execute("SELECT user_id FROM allowed_users")
@@ -1623,8 +1622,11 @@ def webhook():
                             body = f"📋 Task preview for user {target_user} (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
                             
                             keyboard = []
+                            nav_buttons = []
                             if total_pages > 1:
-                                keyboard.append([{"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_1"}])
+                                nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_1"})
+                            if nav_buttons:
+                                keyboard.append(nav_buttons)
                             keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
                         
                         clear_owner_state(uid)
@@ -1633,7 +1635,7 @@ def webhook():
                         send_message(uid, body, {"inline_keyboard": keyboard})
                         return jsonify({"ok": True})
             
-            # Handle commands
+            # Handle commands (only if not in owner input mode)
             if text.startswith("/"):
                 parts = text.split(None, 1)
                 cmd = parts[0].split("@")[0].lower()
@@ -1653,7 +1655,15 @@ def webhook():
                 else:
                     return handle_command(uid, username, cmd, args)
             else:
-                return handle_user_text(uid, username, text)
+                # Handle regular text input (only if not in owner input mode)
+                if not (state and uid in OWNER_IDS):
+                    return handle_user_text(uid, username, text)
+                else:
+                    # If owner is in input mode but sent text without starting with /, 
+                    # it means they're responding to a prompt. We already handled this above.
+                    # Just send a helpful message
+                    send_message(uid, "ℹ️ You're in input mode for an owner operation. Please complete the operation or use /ownersets to cancel.")
+                    return jsonify({"ok": True})
     except Exception:
         logger.exception("webhook handling error")
     return jsonify({"ok": True})
