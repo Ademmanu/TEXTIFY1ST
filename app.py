@@ -1069,7 +1069,7 @@ def _graceful_shutdown(signum, frame):
 signal.signal(signal.SIGTERM, _graceful_shutdown)
 signal.signal(signal.SIGINT, _graceful_shutdown)
 
-# Owner operations state management
+# Owner operations state management - now blocks task processing
 _owner_ops_lock = threading.Lock()
 _owner_ops_state: Dict[int, Dict] = {}
 
@@ -1084,6 +1084,11 @@ def set_owner_state(user_id: int, state: Dict):
 def clear_owner_state(user_id: int):
     with _owner_ops_lock:
         _owner_ops_state.pop(user_id, None)
+
+def is_owner_in_operation(user_id: int) -> bool:
+    """Check if owner is currently in an operation that requires input"""
+    with _owner_ops_lock:
+        return user_id in _owner_ops_state
 
 def get_user_tasks_preview(user_id: int, hours: int, page: int = 0) -> Tuple[List[Dict], int, int]:
     """Get tasks preview for a user within specified hours, paginated"""
@@ -1461,181 +1466,182 @@ def webhook():
             except Exception:
                 logger.exception("webhook: update allowed_users username failed")
 
-            # Check if owner is in input mode - handle BEFORE checking commands
-            state = get_owner_state(uid)
-            if state and uid in OWNER_IDS:
-                operation = state.get("operation")
-                step = state.get("step", 0)
-                
-                # IMPORTANT: Return immediately to prevent text splitting for owner inputs
-                if operation == "adduser":
-                    parts = re.split(r"[,\s]+", text.strip())
-                    added, already, invalid = [], [], []
-                    for p in parts:
-                        if not p:
-                            continue
+            # Check if owner is in input mode - handle BEFORE checking commands or regular text
+            # IMPORTANT: This check comes FIRST to block task processing for owners in operation
+            if uid in OWNER_IDS and is_owner_in_operation(uid):
+                state = get_owner_state(uid)
+                if state:
+                    operation = state.get("operation")
+                    step = state.get("step", 0)
+                    
+                    if operation == "adduser":
+                        parts = re.split(r"[,\s]+", text.strip())
+                        added, already, invalid = [], [], []
+                        for p in parts:
+                            if not p:
+                                continue
+                            try:
+                                tid = int(p)
+                            except Exception:
+                                invalid.append(p)
+                                continue
+                            with _db_lock:
+                                c = GLOBAL_DB_CONN.cursor()
+                                c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (tid,))
+                                if c.fetchone():
+                                    already.append(tid)
+                                    continue
+                                c.execute("INSERT INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", (tid, "", now_ts()))
+                                GLOBAL_DB_CONN.commit()
+                            added.append(tid)
+                            try:
+                                send_message(tid, f"✅ You have been added. Send any text to start.")
+                            except Exception:
+                                pass
+                        parts_msgs = []
+                        if added: parts_msgs.append("Added: " + ", ".join(str(x) for x in added))
+                        if already: parts_msgs.append("Already present: " + ", ".join(str(x) for x in already))
+                        if invalid: parts_msgs.append("Invalid: " + ", ".join(invalid))
+                        result_msg = "✅ " + ("; ".join(parts_msgs) if parts_msgs else "No changes")
+                        
+                        clear_owner_state(uid)
+                        send_message(uid, f"{result_msg}\n\nUse /ownersets again to access the menu. 😊")
+                        return jsonify({"ok": True})
+                    
+                    elif operation == "suspend":
+                        if step == 0:
+                            parts = text.split()
+                            if len(parts) < 2:
+                                send_message(uid, "⚠️ Please provide both User ID and duration. Example: 123456789 30s")
+                                return jsonify({"ok": True})
+                            
+                            try:
+                                target = int(parts[0])
+                            except Exception:
+                                send_message(uid, "❌ Invalid User ID. Please try again.")
+                                return jsonify({"ok": True})
+                            
+                            dur = parts[1]
+                            reason = " ".join(parts[2:]) if len(parts) > 2 else ""
+                            m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
+                            if not m:
+                                send_message(uid, "❌ Invalid duration format. Examples: 30s 10m 2h 1d")
+                                return jsonify({"ok": True})
+                            
+                            val, unit = int(m.group(1)), (m.group(2) or "s")
+                            mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
+                            seconds = val * mul
+                            
+                            suspend_user(target, seconds, reason)
+                            reason_part = f"\nReason: {reason}" if reason else ""
+                            until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
+                            
+                            clear_owner_state(uid)
+                            send_message(uid, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} suspended until {until_wat}.{reason_part}\n\nUse /ownersets again to access the menu. 😊")
+                            return jsonify({"ok": True})
+                    
+                    elif operation == "unsuspend":
                         try:
-                            tid = int(p)
+                            target = int(text.strip())
                         except Exception:
-                            invalid.append(p)
-                            continue
+                            send_message(uid, "❌ Invalid User ID. Please try again.")
+                            return jsonify({"ok": True})
+                        
+                        ok = unsuspend_user(target)
+                        if ok:
+                            result = f"✅ User {label_for_owner_view(target, fetch_display_username(target))} unsuspended."
+                        else:
+                            result = f"ℹ️ User {target} is not suspended."
+                        
+                        clear_owner_state(uid)
+                        send_message(uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
+                        return jsonify({"ok": True})
+                    
+                    elif operation == "broadcast":
+                        # IMPORTANT: Don't enqueue broadcast text as a task
                         with _db_lock:
                             c = GLOBAL_DB_CONN.cursor()
-                            c.execute("SELECT 1 FROM allowed_users WHERE user_id = ?", (tid,))
-                            if c.fetchone():
-                                already.append(tid)
-                                continue
-                            c.execute("INSERT INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)", (tid, "", now_ts()))
-                            GLOBAL_DB_CONN.commit()
-                        added.append(tid)
-                        try:
-                            send_message(tid, f"✅ You have been added. Send any text to start.")
-                        except Exception:
-                            pass
-                    parts_msgs = []
-                    if added: parts_msgs.append("Added: " + ", ".join(str(x) for x in added))
-                    if already: parts_msgs.append("Already present: " + ", ".join(str(x) for x in already))
-                    if invalid: parts_msgs.append("Invalid: " + ", ".join(invalid))
-                    result_msg = "✅ " + ("; ".join(parts_msgs) if parts_msgs else "No changes")
-                    
-                    clear_owner_state(uid)
-                    send_message(uid, f"{result_msg}\n\nUse /ownersets again to access the menu. 😊")
-                    return jsonify({"ok": True})
-                
-                elif operation == "suspend":
-                    if step == 0:
-                        parts = text.split()
-                        if len(parts) < 2:
-                            send_message(uid, "⚠️ Please provide both User ID and duration. Example: 123456789 30s")
-                            return jsonify({"ok": True})
-                        
-                        try:
-                            target = int(parts[0])
-                        except Exception:
-                            send_message(uid, "❌ Invalid User ID. Please try again.")
-                            return jsonify({"ok": True})
-                        
-                        dur = parts[1]
-                        reason = " ".join(parts[2:]) if len(parts) > 2 else ""
-                        m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
-                        if not m:
-                            send_message(uid, "❌ Invalid duration format. Examples: 30s 10m 2h 1d")
-                            return jsonify({"ok": True})
-                        
-                        val, unit = int(m.group(1)), (m.group(2) or "s")
-                        mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
-                        seconds = val * mul
-                        
-                        suspend_user(target, seconds, reason)
-                        reason_part = f"\nReason: {reason}" if reason else ""
-                        until_wat = utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))
+                            c.execute("SELECT user_id FROM allowed_users")
+                            rows = c.fetchall()
+                        succeeded, failed = [], []
+                        header = f"📣 Broadcast from {OWNER_TAG}:\n\n{text}"
+                        for r in rows:
+                            tid = r[0]
+                            ok, reason = broadcast_send_raw(tid, header)
+                            if ok:
+                                succeeded.append(tid)
+                            else:
+                                failed.append((tid, reason))
+                        summary = f"✅ Broadcast completed.\nSuccess: {len(succeeded)}, Failed: {len(failed)}"
+                        if failed:
+                            summary += f"\n\nFailed users: {', '.join(f'{x[0]}({x[1]})' for x in failed[:10])}"
+                            if len(failed) > 10:
+                                summary += f" and {len(failed)-10} more..."
                         
                         clear_owner_state(uid)
-                        send_message(uid, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} suspended until {until_wat}.{reason_part}\n\nUse /ownersets again to access the menu. 😊")
-                        return jsonify({"ok": True})
-                
-                elif operation == "unsuspend":
-                    try:
-                        target = int(text.strip())
-                    except Exception:
-                        send_message(uid, "❌ Invalid User ID. Please try again.")
+                        send_message(uid, f"{summary}\n\nUse /ownersets again to access the menu. 😊")
                         return jsonify({"ok": True})
                     
-                    ok = unsuspend_user(target)
-                    if ok:
-                        result = f"✅ User {label_for_owner_view(target, fetch_display_username(target))} unsuspended."
-                    else:
-                        result = f"ℹ️ User {target} is not suspended."
-                    
-                    clear_owner_state(uid)
-                    send_message(uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
-                    return jsonify({"ok": True})
-                
-                elif operation == "broadcast":
-                    # IMPORTANT: Don't enqueue broadcast text as a task
-                    with _db_lock:
-                        c = GLOBAL_DB_CONN.cursor()
-                        c.execute("SELECT user_id FROM allowed_users")
-                        rows = c.fetchall()
-                    succeeded, failed = [], []
-                    header = f"📣 Broadcast from {OWNER_TAG}:\n\n{text}"
-                    for r in rows:
-                        tid = r[0]
-                        ok, reason = broadcast_send_raw(tid, header)
-                        if ok:
-                            succeeded.append(tid)
-                        else:
-                            failed.append((tid, reason))
-                    summary = f"✅ Broadcast completed.\nSuccess: {len(succeeded)}, Failed: {len(failed)}"
-                    if failed:
-                        summary += f"\n\nFailed users: {', '.join(f'{x[0]}({x[1]})' for x in failed[:10])}"
-                        if len(failed) > 10:
-                            summary += f" and {len(failed)-10} more..."
-                    
-                    clear_owner_state(uid)
-                    send_message(uid, f"{summary}\n\nUse /ownersets again to access the menu. 😊")
-                    return jsonify({"ok": True})
-                
-                elif operation == "checkpreview":
-                    if step == 0:
-                        # First step: get user ID
-                        try:
-                            target_user = int(text.strip())
-                        except Exception:
-                            send_message(uid, "❌ Invalid User ID. Please try again.")
+                    elif operation == "checkpreview":
+                        if step == 0:
+                            # First step: get user ID
+                            try:
+                                target_user = int(text.strip())
+                            except Exception:
+                                send_message(uid, "❌ Invalid User ID. Please try again.")
+                                return jsonify({"ok": True})
+                            
+                            # Save user ID and ask for hours
+                            state["user_id"] = target_user
+                            state["step"] = 1
+                            set_owner_state(uid, state)
+                            
+                            cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
+                            send_message(uid, "⏰ How many hours back should I check? (e.g., 1, 6, 24, 168):", cancel_keyboard)
                             return jsonify({"ok": True})
                         
-                        # Save user ID and ask for hours
-                        state["user_id"] = target_user
-                        state["step"] = 1
-                        set_owner_state(uid, state)
-                        
-                        cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
-                        send_message(uid, "⏰ How many hours back should I check? (e.g., 1, 6, 24, 168):", cancel_keyboard)
-                        return jsonify({"ok": True})
-                    
-                    elif step == 1:
-                        # Second step: get hours
-                        try:
-                            hours = int(text.strip())
-                            if hours <= 0:
-                                raise ValueError
-                        except Exception:
-                            send_message(uid, "❌ Please enter a valid positive number of hours.")
+                        elif step == 1:
+                            # Second step: get hours
+                            try:
+                                hours = int(text.strip())
+                                if hours <= 0:
+                                    raise ValueError
+                            except Exception:
+                                send_message(uid, "❌ Please enter a valid positive number of hours.")
+                                return jsonify({"ok": True})
+                            
+                            target_user = state.get("user_id")
+                            state["hours"] = hours
+                            set_owner_state(uid, state)
+                            
+                            # Get tasks preview
+                            tasks, total_tasks, total_pages = get_user_tasks_preview(target_user, hours, 0)
+                            
+                            if not tasks:
+                                body = f"📋 No tasks found for user {target_user} in the last {hours} hours."
+                                keyboard = [[{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}]]
+                            else:
+                                lines = []
+                                for task in tasks:
+                                    lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
+                                
+                                body = f"📋 Task preview for user {target_user} (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
+                                
+                                keyboard = []
+                                nav_buttons = []
+                                if total_pages > 1:
+                                    nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_1"})
+                                if nav_buttons:
+                                    keyboard.append(nav_buttons)
+                                keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
+                            
+                            clear_owner_state(uid)
+                            
+                            # Send the preview
+                            send_message(uid, body, {"inline_keyboard": keyboard})
                             return jsonify({"ok": True})
-                        
-                        target_user = state.get("user_id")
-                        state["hours"] = hours
-                        set_owner_state(uid, state)
-                        
-                        # Get tasks preview
-                        tasks, total_tasks, total_pages = get_user_tasks_preview(target_user, hours, 0)
-                        
-                        if not tasks:
-                            body = f"📋 No tasks found for user {target_user} in the last {hours} hours."
-                            keyboard = [[{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}]]
-                        else:
-                            lines = []
-                            for task in tasks:
-                                lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
-                            
-                            body = f"📋 Task preview for user {target_user} (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
-                            
-                            keyboard = []
-                            nav_buttons = []
-                            if total_pages > 1:
-                                nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_1"})
-                            if nav_buttons:
-                                keyboard.append(nav_buttons)
-                            keyboard.append([{"text": "🔙 Back to Menu", "callback_data": "owner_backtomenu"}])
-                        
-                        clear_owner_state(uid)
-                        
-                        # Send the preview
-                        send_message(uid, body, {"inline_keyboard": keyboard})
-                        return jsonify({"ok": True})
             
-            # Handle commands (only if not in owner input mode)
+            # Handle commands
             if text.startswith("/"):
                 parts = text.split(None, 1)
                 cmd = parts[0].split("@")[0].lower()
@@ -1655,15 +1661,8 @@ def webhook():
                 else:
                     return handle_command(uid, username, cmd, args)
             else:
-                # Handle regular text input (only if not in owner input mode)
-                if not (state and uid in OWNER_IDS):
-                    return handle_user_text(uid, username, text)
-                else:
-                    # If owner is in input mode but sent text without starting with /, 
-                    # it means they're responding to a prompt. We already handled this above.
-                    # Just send a helpful message
-                    send_message(uid, "ℹ️ You're in input mode for an owner operation. Please complete the operation or use /ownersets to cancel.")
-                    return jsonify({"ok": True})
+                # Handle regular text input
+                return handle_user_text(uid, username, text)
     except Exception:
         logger.exception("webhook handling error")
     return jsonify({"ok": True})
@@ -1810,6 +1809,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     return jsonify({"ok": True})
 
 def handle_user_text(user_id: int, username: str, text: str):
+    # BLOCK OWNER TASK PROCESSING: If owner is in operation mode, don't process their text as task
+    if user_id in OWNER_IDS and is_owner_in_operation(user_id):
+        # Owner is in middle of an operation - send helpful message
+        send_message(user_id, "⚠️ You're currently in an owner operation. Please complete it or use /ownersets to cancel.")
+        return jsonify({"ok": True})
+    
     if user_id not in OWNER_IDS and not is_allowed(user_id):
         send_message(user_id, f"🚫 Sorry, you are not allowed. {OWNER_TAG} notified.\nYour ID: {user_id}")
         notify_owners(f"🚨 Unallowed access attempt by {at_username(username) if username else user_id} (ID: {user_id}).")
