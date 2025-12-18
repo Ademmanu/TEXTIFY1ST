@@ -1376,60 +1376,61 @@ def webhook():
                 return jsonify({"ok": True})
             
             elif data.startswith("owner_checkpreview_"):
-                # Handle pagination for check preview
+                # Handle pagination for check preview - FIXED VERSION
                 parts = data.split("_")
                 if len(parts) == 4:  # owner_checkpreview_userid_page
                     target_user = int(parts[2])
                     page = int(parts[3])
+                    # We need to get the hours from state or use default
                     state = get_owner_state(uid)
-                    if state and state.get("operation") == "checkpreview" and state.get("user_id") == target_user:
-                        hours = state.get("hours", 24)
-                        tasks, total_tasks, total_pages = get_user_tasks_preview(target_user, hours, page)
+                    hours = state.get("hours", 24) if state else 24
+                    
+                    tasks, total_tasks, total_pages = get_user_tasks_preview(target_user, hours, page)
+                    
+                    if not tasks:
+                        body = f"📋 No tasks found for user {target_user} in the last {hours} hours."
+                    else:
+                        lines = []
+                        for task in tasks:
+                            lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
                         
-                        if not tasks:
-                            body = f"📋 No tasks found for user {target_user} in the last {hours} hours."
-                        else:
-                            lines = []
-                            for task in tasks:
-                                lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
-                            
-                            body = f"📋 Task preview for user {target_user} (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
-                        
-                        # Create keyboard with navigation buttons if needed
-                        keyboard = []
-                        nav_buttons = []
-                        if page > 0:
-                            nav_buttons.append({"text": "⬅️ Previous", "callback_data": f"owner_checkpreview_{target_user}_{page-1}"})
-                        if page + 1 < total_pages:
-                            nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_{page+1}"})
-                        if nav_buttons:
-                            keyboard.append(nav_buttons)
-                        
-                        # Add the regular menu buttons
-                        keyboard.extend([
-                            [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
-                            [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
-                            [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
-                            [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]
-                        ])
-                        
-                        menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
-                        
-                        try:
-                            _session.post(f"{TELEGRAM_API}/editMessageText", json={
-                                "chat_id": callback["message"]["chat"]["id"],
-                                "message_id": callback["message"]["message_id"],
-                                "text": menu_text,
-                                "reply_markup": {"inline_keyboard": keyboard}
-                            }, timeout=2)
-                        except Exception:
-                            pass
-                        try:
-                            _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
-                                "callback_query_id": callback.get("id")
-                            }, timeout=2)
-                        except Exception:
-                            pass
+                        body = f"📋 Task preview for user {target_user} (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
+                    
+                    # Create keyboard with navigation buttons if needed
+                    keyboard = []
+                    nav_buttons = []
+                    if page > 0:
+                        nav_buttons.append({"text": "⬅️ Previous", "callback_data": f"owner_checkpreview_{target_user}_{page-1}"})
+                    if page + 1 < total_pages:
+                        nav_buttons.append({"text": "Next ➡️", "callback_data": f"owner_checkpreview_{target_user}_{page+1}"})
+                    if nav_buttons:
+                        keyboard.append(nav_buttons)
+                    
+                    # Add the regular menu buttons
+                    keyboard.extend([
+                        [{"text": "📊 Bot Info", "callback_data": "owner_botinfo"}, {"text": "👥 List Users", "callback_data": "owner_listusers"}],
+                        [{"text": "🚫 List Suspended", "callback_data": "owner_listsuspended"}, {"text": "➕ Add User", "callback_data": "owner_adduser"}],
+                        [{"text": "⏸️ Suspend User", "callback_data": "owner_suspend"}, {"text": "▶️ Unsuspend User", "callback_data": "owner_unsuspend"}],
+                        [{"text": "🔍 Check User Preview", "callback_data": "owner_checkpreview"}]
+                    ])
+                    
+                    menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{body}"
+                    
+                    try:
+                        _session.post(f"{TELEGRAM_API}/editMessageText", json={
+                            "chat_id": callback["message"]["chat"]["id"],
+                            "message_id": callback["message"]["message_id"],
+                            "text": menu_text,
+                            "reply_markup": {"inline_keyboard": keyboard}
+                        }, timeout=2)
+                    except Exception:
+                        pass
+                    try:
+                        _session.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
+                            "callback_query_id": callback.get("id")
+                        }, timeout=2)
+                    except Exception:
+                        pass
                 return jsonify({"ok": True})
             
             elif data in ["owner_adduser", "owner_suspend", "owner_unsuspend", "owner_checkpreview"]:
