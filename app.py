@@ -1326,6 +1326,74 @@ def get_user_index(user_id: int):
             return i, users
     return -1, users
 
+def parse_duration(duration_str: str) -> Tuple[int, str]:
+    """
+    Parse duration strings like:
+    - "30s" (30 seconds)
+    - "10m" (10 minutes) 
+    - "2h" (2 hours)
+    - "1d" (1 day)
+    - "1d2h3m5s" (1 day, 2 hours, 3 minutes, 5 seconds)
+    - "2h30m" (2 hours, 30 minutes)
+    Returns (total_seconds, formatted_string) or (None, error_message)
+    """
+    if not duration_str:
+        return None, "Empty duration"
+    
+    # Regular expression to match patterns like: 1d, 2h, 3m, 4s, or combinations like 1d2h3m4s
+    pattern = r'(\d+)([dhms])'
+    matches = re.findall(pattern, duration_str.lower())
+    
+    if not matches:
+        return None, f"Invalid duration format: {duration_str}"
+    
+    total_seconds = 0
+    parts = []
+    
+    # Unit multipliers
+    multipliers = {
+        'd': 86400,  # days to seconds
+        'h': 3600,   # hours to seconds
+        'm': 60,     # minutes to seconds
+        's': 1       # seconds
+    }
+    
+    # Unit labels
+    labels = {
+        'd': 'day',
+        'h': 'hour', 
+        'm': 'minute',
+        's': 'second'
+    }
+    
+    for value, unit in matches:
+        try:
+            num = int(value)
+            if num <= 0:
+                return None, f"Value must be positive: {value}{unit}"
+            
+            total_seconds += num * multipliers[unit]
+            
+            # Build formatted string part
+            label = labels[unit]
+            if num == 1:
+                parts.append(f"{num} {label}")
+            else:
+                parts.append(f"{num} {label}s")
+                
+        except ValueError:
+            return None, f"Invalid number: {value}{unit}"
+        except KeyError:
+            return None, f"Invalid unit: {unit}"
+    
+    if total_seconds == 0:
+        return None, "Duration cannot be zero"
+    
+    # Create formatted string
+    formatted = ", ".join(parts)
+    
+    return total_seconds, formatted
+
 def send_ownersets_menu(owner_id: int):
     """Send the main owner menu with inline buttons"""
     menu_text = f"👑 Owner Menu {OWNER_TAG}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSelect an operation:"
@@ -1673,6 +1741,7 @@ def webhook():
                     # For check all user preview, ask for hours first
                     set_owner_state(uid, {"operation": operation, "step": 0})
                     
+                    # ADD CANCEL BUTTON HERE TOO
                     cancel_keyboard = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "owner_cancelinput"}]]}
                     
                     try:
@@ -1693,7 +1762,8 @@ def webhook():
                     
                     prompts = {
                         "adduser": "👤 Please send the User ID to add (you can add multiple IDs separated by spaces or commas):",
-                        "suspend": "⏸️ Please send:\n1. User ID\n2. Duration (e.g., 30s, 10m, 2h, 1d)\n3. Optional reason\n\nExample: 123456789 30s Too many requests",
+                        # UPDATED SUSPEND PROMPT WITH FLEXIBLE DURATION FORMATS
+                        "suspend": "⏸️ Please send:\n1. User ID\n2. Duration (e.g., 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s)\n3. Optional reason\n\nExamples:\n• 123456789 30s Too many requests\n• 123456789 1d2h Spamming\n• 123456789 2h30m Violation",
                         "unsuspend": "▶️ Please send the User ID to unsuspend:",
                     }
                     
@@ -1804,9 +1874,9 @@ def webhook():
                     
                     elif operation == "suspend":
                         if step == 0:
-                            parts = text.split()
+                            parts = text.split(maxsplit=2)  # Split into max 3 parts
                             if len(parts) < 2:
-                                send_message(uid, "⚠️ Please provide both User ID and duration. Example: 123456789 30s")
+                                send_message(uid, "⚠️ Please provide both User ID and duration. Example: 123456789 1d2h")
                                 return jsonify({"ok": True})
                             
                             try:
@@ -1816,15 +1886,15 @@ def webhook():
                                 return jsonify({"ok": True})
                             
                             dur = parts[1]
-                            reason = " ".join(parts[2:]) if len(parts) > 2 else ""
-                            m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
-                            if not m:
-                                send_message(uid, "❌ Invalid duration format. Examples: 30s 10m 2h 1d")
+                            reason = parts[2] if len(parts) > 2 else ""
+                            
+                            # Use the new parse_duration function to handle flexible formats
+                            result = parse_duration(dur)
+                            if result[0] is None:
+                                send_message(uid, f"❌ {result[1]}\n\nValid examples: 30s, 10m, 2h, 1d, 1d2h, 2h30m, 1d2h3m5s")
                                 return jsonify({"ok": True})
                             
-                            val, unit = int(m.group(1)), (m.group(2) or "s")
-                            mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
-                            seconds = val * mul
+                            seconds, formatted_duration = result
                             
                             suspend_user(target, seconds, reason)
                             reason_part = f"\nReason: {reason}" if reason else ""
@@ -1832,8 +1902,8 @@ def webhook():
                             
                             clear_owner_state(uid)
                             # Send completion message
-                            send_message(uid, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} suspended until {until_wat}.{reason_part}\n\nUse /ownersets again to access the menu. 😊")
-                            return jsonify({"ok": True}")
+                            send_message(uid, f"✅ User {label_for_owner_view(target, fetch_display_username(target))} suspended for {formatted_duration} (until {until_wat}).{reason_part}\n\nUse /ownersets again to access the menu. 😊")
+                            return jsonify({"ok": True})
                     
                     elif operation == "unsuspend":
                         try:
@@ -1851,7 +1921,7 @@ def webhook():
                         clear_owner_state(uid)
                         # Send completion message
                         send_message(uid, f"{result}\n\nUse /ownersets again to access the menu. 😊")
-                        return jsonify({"ok": True}")
+                        return jsonify({"ok": True})
                     
                     elif operation == "checkallpreview":
                         if step == 0:
@@ -1862,7 +1932,7 @@ def webhook():
                                     raise ValueError
                             except Exception:
                                 send_message(uid, "❌ Please enter a valid positive number of hours.")
-                                return jsonify({"ok": True})
+                                return jsonify({"ok": True}")
                             
                             # Get all users ordered
                             all_users = get_all_users_ordered()
