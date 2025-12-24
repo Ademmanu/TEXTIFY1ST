@@ -1674,13 +1674,13 @@ def webhook():
                     added_wat = utc_to_wat_ts(added_at_info)
                     
                     if not tasks:
-                        body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n📋 No tasks found in the last {hours} hours."
+                        body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📋 No tasks found in the last {hours} hours."
                     else:
                         lines = []
                         for task in tasks:
                             lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
                         
-                        body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n\n📋 Tasks (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
+                        body = f"👤 User: {user_id_info} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 Tasks (last {hours}h, page {page+1}/{total_pages}):\n\n" + "\n\n".join(lines)
                     
                     # Create navigation buttons
                     keyboard = []
@@ -1950,13 +1950,13 @@ def webhook():
                             tasks, total_tasks, total_pages = get_user_tasks_preview(first_user_id, hours, 0)
                             
                             if not tasks:
-                                body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n📋 No tasks found in the last {hours} hours."
+                                body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📋 No tasks found in the last {hours} hours."
                             else:
                                 lines = []
                                 for task in tasks:
                                     lines.append(f"🕒 {task['created_at']}\n📝 Preview: {task['preview']}\n📊 Progress: {task['sent_count']}/{task['total_words']} words")
                                 
-                                body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n\n📋 Tasks (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
+                                body = f"👤 User: {first_user_id} ({username_display})\nAdded: {added_wat}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 Tasks (last {hours}h, page 1/{total_pages}):\n\n" + "\n\n".join(lines)
                             
                             # Create navigation buttons
                             keyboard = []
